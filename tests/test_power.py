@@ -314,7 +314,8 @@ def test_amd_restore_never_clears_another_gpu_recovery_record(tmp_home, state):
     assert P.pending_restore() == state
 
 
-def test_reset_from_file_restores_amd_original_and_checks_gpu(tmp_home):
+def test_reset_from_file_restores_amd_original_and_checks_gpu(tmp_home, monkeypatch):
+    monkeypatch.setattr("rigtune.hardware._amd_smi_binary", lambda: "amd-smi")
     state = {"vendor": "amd", "gpu_index": 1, "pci_bus_id": "0000:15:00.0", "power_limit_w": 231}
     P._write_restore(state)
     smi = FakeAmdSmi(current=180)
