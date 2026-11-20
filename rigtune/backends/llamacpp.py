@@ -67,6 +67,10 @@ class LlamaCppBackend(BaseBackend):
         }
         if hw.gpu.uuid:
             extra["rigtune_gpu_uuid"] = hw.gpu.uuid
+        if hw.gpu.hip_uuid:
+            extra["rigtune_gpu_hip_uuid"] = hw.gpu.hip_uuid
+        if hw.gpu.pci_bus_id:
+            extra["rigtune_gpu_pci_bus_id"] = hw.gpu.pci_bus_id
         return extra
 
     # ---- prepare: resolve (no download); materialize: download/convert only what the planner kept
@@ -283,19 +287,31 @@ class LlamaCppBackend(BaseBackend):
             args += ["-ctk", cfg.kv_dtype, "-ctv", cfg.kv_dtype]
         if cfg.spec_decode:
             args += self._spec_args(cfg.spec_decode, model, binary)
-        args += render_extra(cfg.extra, skip=("threads", "rigtune_gpu_index", "rigtune_gpu_name", "rigtune_gpu_uuid"))
+        args += render_extra(cfg.extra, skip=("threads", "rigtune_gpu_index", "rigtune_gpu_name", "rigtune_gpu_uuid",
+                                              "rigtune_gpu_hip_uuid", "rigtune_gpu_pci_bus_id"))
         env = {}
         if self.accelerator == "hip":
-            selected = cfg.extra.get("rigtune_gpu_uuid") or cfg.extra.get("rigtune_gpu_index")
+            selected = (cfg.extra.get("rigtune_gpu_hip_uuid") or cfg.extra.get("rigtune_gpu_uuid")
+                        or cfg.extra.get("rigtune_gpu_index"))
             if selected is not None:
                 env["ROCR_VISIBLE_DEVICES"] = str(selected)
                 env["HIP_VISIBLE_DEVICES"] = "0"
         elif self.accelerator == "vulkan":
             gpu_name = str(cfg.extra.get("rigtune_gpu_name") or "")
-            index = llama_server_device_index("vulkan", gpu_name, binary)
+            gpu_identity = str(cfg.extra.get("rigtune_gpu_pci_bus_id") or cfg.extra.get("rigtune_gpu_uuid") or "")
+            index = llama_server_device_index("vulkan", gpu_name, binary,
+                                              gpu_identity=gpu_identity or None)
             if index is None:
-                raise RuntimeError(f"llama-server Vulkan build does not list selected GPU {gpu_name!r}")
-            env["GGML_VK_VISIBLE_DEVICES"] = str(index)
+                raise RuntimeError(f"llama-server Vulkan build does not uniquely identify selected GPU {gpu_name!r}; "
+                                   "check `llama-server --list-devices` for a matching, unambiguous device")
+            if "--device" in server_help(binary):
+                args += ["--device", f"Vulkan{index}"]
+            else:
+                mask = os.environ.get("GGML_VK_VISIBLE_DEVICES")
+                if mask is not None:
+                    raise RuntimeError("this llama-server build has no --device selector; clear "
+                                       "GGML_VK_VISIBLE_DEVICES or use a newer build to pin the selected GPU")
+                env["GGML_VK_VISIBLE_DEVICES"] = str(index)
         elif not self.gpu_backend:
             env.update({
                 "CUDA_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "",

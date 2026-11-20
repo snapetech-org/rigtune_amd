@@ -27,10 +27,13 @@ class GPUInfo(BaseModel):
     index: int = 0
     compute_capability: Optional[Tuple[int, int]] = None
     vram_total_bytes: int = 0
-    vram_free_bytes: int = 0
+    vram_free_bytes: Optional[int] = None
     driver_version: Optional[str] = None
     cuda_version: Optional[str] = None
     uuid: Optional[str] = None
+    hip_uuid: Optional[str] = None
+    pci_bus_id: Optional[str] = None
+    architecture: Optional[str] = None  # e.g. gfx1100; CUDA compute capability remains in compute_capability
 
     @property
     def cc(self) -> Tuple[int, int]:
@@ -89,7 +92,7 @@ class HardwareDescriptor(BaseModel):
     def available_memory_bytes(self) -> int:
         """Memory the planner budgets against: free VRAM if a GPU exists, else free RAM."""
         if self.gpu is not None:
-            return self.gpu.vram_free_bytes
+            return self.gpu.vram_free_bytes or 0
         return self.cpu.ram_free_bytes
 
 

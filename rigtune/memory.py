@@ -175,7 +175,7 @@ def estimate(
         kv //= cfg.tp
 
     if available is None:
-        available = hw.gpu.vram_free_bytes if (mm.device == "gpu" and hw.gpu) else hw.cpu.ram_free_bytes
+        available = (hw.gpu.vram_free_bytes or 0) if (mm.device == "gpu" and hw.gpu) else hw.cpu.ram_free_bytes
     margin = safety_margin(available, mm.margin_fraction)
     workspace = mm.runtime_workspace + (int(mm.extra_fn(cfg)) if mm.extra_fn is not None else 0)
     total = weights + kv + workspace + margin

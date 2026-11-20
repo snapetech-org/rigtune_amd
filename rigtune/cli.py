@@ -778,8 +778,10 @@ def probe(
     console.print(f"[bold]hardware hash[/]: {hardware_hash(hw)}   [dim]{hw.os}, python {hw.python}[/]")
     if hw.gpus:
         for g in hw.gpus:
-            console.print(f"[bold]GPU {g.index}[/]: {g.name} (cc {g.cc[0]}.{g.cc[1]}) "
-                          f"{g.vram_free_bytes / GiB:.1f}/{g.vram_total_bytes / GiB:.1f} GiB free, "
+            free = f"{g.vram_free_bytes / GiB:.1f}" if g.vram_free_bytes is not None else "?"
+            total = f"{g.vram_total_bytes / GiB:.1f}" if g.vram_total_bytes else "?"
+            arch = f", {g.architecture}" if g.architecture else f", cc {g.cc[0]}.{g.cc[1]}"
+            console.print(f"[bold]GPU {g.index}[/]: {g.name}{arch} {free}/{total} GiB free, "
                           f"driver {g.driver_version or '?'}, CUDA {g.cuda_version or '?'}")
     else:
         console.print("[bold]GPU[/]: none")

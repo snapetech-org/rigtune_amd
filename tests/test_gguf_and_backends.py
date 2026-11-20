@@ -119,11 +119,47 @@ def test_llamacpp_hip_launch_pins_the_selected_amd_gpu(hw_rx7900xt, prepared_lla
 def test_llamacpp_vulkan_launch_selects_the_matching_device(hw_rx7900xt, prepared_llamacpp, monkeypatch):
     import rigtune.backends.llamacpp as lc
 
-    monkeypatch.setattr(lc, "llama_server_device_index", lambda backend, name, binary=None: 3)
+    monkeypatch.setattr(lc, "llama_server_device_index", lambda backend, name, binary=None, gpu_identity=None: 3)
+    monkeypatch.setattr(lc, "server_help", lambda _binary: "--device <dev1,dev2,..>")
     be = get_backend("llamacpp-vulkan")
     cfg = be.default_config(hw_rx7900xt, prepared_llamacpp)
     spec = be.launch_spec(cfg, prepared_llamacpp, 9007)
-    assert spec.env == {"GGML_VK_VISIBLE_DEVICES": "3"}
+    assert spec.env == {}
+    assert spec.args[spec.args.index("--device") + 1] == "Vulkan3"
+
+
+@pytest.mark.usefixtures("no_network")
+def test_llamacpp_hip_prefers_the_rocm_uuid(hw_rx7900xt, prepared_llamacpp):
+    gpu = hw_rx7900xt.gpus[0].model_copy(update={"uuid": "23007550-0000-1000-8088-c382a826700f",
+                                                 "hip_uuid": "GPU-2388c382a826700f"})
+    hw = hw_rx7900xt.model_copy(update={"gpus": [gpu]})
+    be = get_backend("llamacpp-hip")
+    spec = be.launch_spec(be.default_config(hw, prepared_llamacpp), prepared_llamacpp, 9008)
+    assert spec.env["ROCR_VISIBLE_DEVICES"] == "GPU-2388c382a826700f"
+
+
+@pytest.mark.usefixtures("no_network")
+def test_llamacpp_vulkan_refuses_ambiguous_selected_device(hw_rx7900xt, prepared_llamacpp, monkeypatch):
+    import rigtune.backends.llamacpp as lc
+
+    monkeypatch.setattr(lc, "llama_server_device_index", lambda backend, name, binary=None, gpu_identity=None: None)
+    be = get_backend("llamacpp-vulkan")
+    cfg = be.default_config(hw_rx7900xt, prepared_llamacpp)
+    with pytest.raises(RuntimeError, match="does not uniquely identify"):
+        be.launch_spec(cfg, prepared_llamacpp, 9009)
+
+
+@pytest.mark.usefixtures("no_network")
+def test_llamacpp_vulkan_fallback_does_not_replace_user_mask(hw_rx7900xt, prepared_llamacpp, monkeypatch):
+    import rigtune.backends.llamacpp as lc
+
+    monkeypatch.setattr(lc, "llama_server_device_index", lambda backend, name, binary=None, gpu_identity=None: 3)
+    monkeypatch.setattr(lc, "server_help", lambda _binary: "")
+    monkeypatch.setenv("GGML_VK_VISIBLE_DEVICES", "0,1")
+    be = get_backend("llamacpp-vulkan")
+    cfg = be.default_config(hw_rx7900xt, prepared_llamacpp)
+    with pytest.raises(RuntimeError, match="no --device selector"):
+        be.launch_spec(cfg, prepared_llamacpp, 9010)
 
 
 def test_vllm_cpu_env(hw_cpu_avx512, prepared_vllm):

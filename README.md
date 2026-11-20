@@ -72,6 +72,8 @@ Optional extras:
 - **SGLang** can live in its own environment: set `SGLANG_PYTHON` to its `python`.
 - **llama.cpp** needs `llama-server` built for your runtime. CUDA uses `LLAMA_SERVER_CUDA`, HIP/ROCm uses `LLAMA_SERVER_HIP`, and Vulkan uses `LLAMA_SERVER_VULKAN`; all may fall back to `LLAMA_SERVER` or `PATH`.
 
+AMD discovery and llama.cpp device selection: [docs/amd.md](docs/amd.md).
+
 With Docker (built on the official vLLM image):
 
 ```bash

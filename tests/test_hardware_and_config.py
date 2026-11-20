@@ -79,6 +79,64 @@ def test_rocm_smi_json_maps_amd_uuid_memory_and_runtime_index():
     assert gpus[0].vram_free_bytes == 21_399_822_336
 
 
+def test_amd_smi_inventory_uses_hip_order_and_stable_ids():
+    from rigtune.hardware import _parse_amd_smi_inventory
+
+    listing = [{"gpu": 0, "bdf": "0000:03:00.0", "uuid": "23007550-0000-1000-8088-c382a826700f",
+                "node_id": 1, "hip_id": 0, "hip_uuid": "GPU-2388c382a826700f"}]
+    static = {"gpu_data": [{"gpu": 0, "asic": {"market_name": "AMD Radeon RX 7900 XT",
+                                                    "target_graphics_version": "gfx1100"},
+                             "vram": {"size": {"value": 20480, "unit": "MB"}}}]}
+    metrics = {"gpu_data": [{"gpu": 0, "mem_usage": {"total_vram": {"value": 20480, "unit": "MB"},
+                                                       "free_vram": {"value": 19000, "unit": "MB"}}}]}
+
+    (gpu,) = _parse_amd_smi_inventory(listing, static, metrics)
+    assert (gpu.name, gpu.index, gpu.architecture) == ("AMD Radeon RX 7900 XT", 0, "gfx1100")
+    assert gpu.pci_bus_id == "0000:03:00.0"
+    assert gpu.uuid == "23007550-0000-1000-8088-c382a826700f"
+    assert gpu.hip_uuid == "GPU-2388c382a826700f"
+    assert gpu.vram_total_bytes == 20 * 1024**3
+    assert gpu.vram_free_bytes == 19000 * 1024**2
+
+
+def test_amd_smi_inventory_keeps_missing_memory_unavailable():
+    from rigtune.hardware import _parse_amd_smi_inventory
+
+    listing = [{"gpu": 0, "bdf": "0000:03:00.0", "hip_id": 0}]
+    static = {"gpu_data": [{"gpu": 0, "asic": {"market_name": "AMD Radeon RX 7900 XT"}}]}
+    (gpu,) = _parse_amd_smi_inventory(listing, static)
+    assert gpu.vram_total_bytes == 0
+    assert gpu.vram_free_bytes is None
+
+
+def test_amd_smi_inventory_skips_malformed_and_duplicate_rows():
+    from rigtune.hardware import _parse_amd_smi_inventory
+
+    assert _parse_amd_smi_inventory("not json", {}, {}) == []
+    listing = [{"gpu": 0, "bdf": "0000:03:00.0", "hip_id": 0},
+               {"gpu": 0, "bdf": "0000:03:00.0", "hip_id": 0}]
+    static = {"gpu_data": [{"gpu": 0, "asic": {"market_name": "AMD Radeon RX 7900 XT"}}]}
+    assert len(_parse_amd_smi_inventory(listing, static)) == 1
+
+
+def test_llama_server_device_match_refuses_duplicate_names(monkeypatch):
+    import rigtune.hardware as hardware
+
+    monkeypatch.setattr(hardware, "_llama_server_info", lambda _binary: (None, {"vulkan"}, [
+        ("vulkan", 0, "AMD Radeon RX 7900 XT"), ("vulkan", 1, "AMD Radeon RX 7900 XT")]))
+    assert hardware.llama_server_device_index("vulkan", "AMD Radeon RX 7900 XT", "/llama") is None
+
+
+def test_llama_server_device_match_prefers_unique_pci_identity(monkeypatch):
+    import rigtune.hardware as hardware
+
+    monkeypatch.setattr(hardware, "_llama_server_info", lambda _binary: (None, {"vulkan"}, [
+        ("vulkan", 0, "AMD Radeon RX 7900 XT [0000:03:00.0]"),
+        ("vulkan", 1, "AMD Radeon RX 7900 XT [0000:04:00.0]")]))
+    assert hardware.llama_server_device_index("vulkan", "AMD Radeon RX 7900 XT", "/llama",
+                                              gpu_identity="0000:04:00.0") == 1
+
+
 def test_rocm_visibility_masks_allow_uuid_and_hip_relative_index(monkeypatch):
     from rigtune.hardware import visible_gpus
     from rigtune.models import GPUInfo
@@ -89,6 +147,16 @@ def test_rocm_visibility_masks_allow_uuid_and_hip_relative_index(monkeypatch):
     monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "GPU-7900")
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
     assert [gpu.name for gpu in visible_gpus(gpus)] == ["RX 7900 XT"]
+
+
+def test_rocr_visibility_accepts_amd_smi_hip_uuid(monkeypatch):
+    from rigtune.hardware import visible_gpus
+    from rigtune.models import GPUInfo
+
+    gpu = GPUInfo(vendor="amd", name="RX 7900 XT", index=1, hip_uuid="GPU-hip-7900")
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "GPU-hip-7900")
+    assert visible_gpus([gpu]) == [gpu]
 
 
 def test_backend_reasons_explain_a_masked_gpu(monkeypatch):
