@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 BACKEND_NAMES = (
     "vllm", "sglang", "llamacpp-cuda", "llamacpp-hip", "llamacpp-vulkan", "llamacpp-cpu", "vllm-cpu"
 )
+ROCM_GPU_ARCHES = frozenset({"gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1150", "gfx1151",
+                             "gfx1200", "gfx1201"})
 
 
 # --------------------------------------------------------------------------- GPU
@@ -774,52 +776,125 @@ def _torch_is_cuda_build() -> Optional[bool]:
         return None
 
 
+_TORCH_RUNTIME_CODE = (
+    "import json\n"
+    "try:\n"
+    " import torch\n"
+    " runtime = 'rocm' if getattr(torch.version, 'hip', None) else ('cuda' if getattr(torch.version, 'cuda', None) else 'cpu')\n"
+    "except Exception:\n"
+    " runtime = None\n"
+    "print(json.dumps({'runtime': runtime}))\n"
+)
+
+
+def _torch_runtime(python: Optional[str] = None) -> Optional[str]:
+    """Return the accelerator runtime compiled into the engine's PyTorch, never from device visibility."""
+    if python and python != sys.executable:
+        try:
+            out = subprocess.run([python, "-c", _TORCH_RUNTIME_CODE], capture_output=True, text=True, timeout=30)
+            if out.returncode == 0:
+                row = json.loads(out.stdout.strip().splitlines()[-1])
+                return row.get("runtime") if row.get("runtime") in ("cuda", "rocm", "cpu") else None
+        except Exception as exc:
+            logger.debug("could not identify torch runtime in %s: %s", python, exc)
+        return None
+    cuda = _torch_is_cuda_build()
+    if cuda is True:
+        return "cuda"
+    if importlib.util.find_spec("torch") is None:
+        return None
+    try:
+        import torch  # type: ignore
+
+        if getattr(torch.version, "hip", None):
+            return "rocm"
+    except Exception:
+        return None
+    return "cpu" if cuda is False else None
+
+
 def probe_backends(gpus: List[GPUInfo]) -> Dict[str, BackendAvailability]:
     out: Dict[str, BackendAvailability] = {}
     has_nvidia = any(g.vendor == "nvidia" for g in gpus)
+    has_amd = any(g.vendor == "amd" for g in gpus)
+    amd_gpu = next((gpu for gpu in gpus if gpu.vendor == "amd"), None)
+    amd_arch = amd_gpu.architecture if amd_gpu else None
+    amd_arch_supported = amd_arch in ROCM_GPU_ARCHES
 
     vllm_ver = _pkg_version("vllm")
     vllm_importable = importlib.util.find_spec("vllm") is not None
     torch_cuda = _torch_is_cuda_build()
+    vllm_runtime = _torch_runtime()
     if not vllm_importable:
         vllm_reason = "vllm not importable"
-    elif not has_nvidia:
+    elif has_amd and vllm_runtime == "cpu":
+        vllm_reason = "vLLM's PyTorch is a CPU build; an AMD GPU requires a ROCm build"
+    elif has_amd and not has_nvidia and vllm_runtime != "rocm":
+        vllm_reason = "vLLM's PyTorch is not a ROCm build for the visible AMD GPU"
+    elif has_amd and vllm_runtime == "rocm" and not amd_arch_supported:
+        vllm_reason = f"unsupported or unknown AMD GPU architecture for ROCm vLLM: {amd_arch or 'unknown'}"
+    elif not has_nvidia and not (has_amd and vllm_runtime == "rocm"):
         vllm_reason = "no usable NVIDIA GPU (check CUDA_VISIBLE_DEVICES)"
-    elif torch_cuda is False:
+    elif has_nvidia and vllm_runtime == "rocm" and not has_amd:
+        vllm_reason = "vLLM's PyTorch is a ROCm build but no AMD GPU is visible"
+    elif torch_cuda is False and vllm_runtime != "rocm":
         vllm_reason = "torch is a CPU build"
     else:
         vllm_reason = None
     vllm_libs = _libs_here() if vllm_ver else {}
     out["vllm"] = BackendAvailability(
         name="vllm",
-        available=bool(vllm_importable and has_nvidia and torch_cuda is not False),
+        available=bool(vllm_importable and ((has_nvidia and vllm_runtime in ("cuda", None))
+                                             or (has_amd and vllm_runtime == "rocm" and amd_arch_supported))),
         version=vllm_ver,
         reason=vllm_reason,
+        runtime=vllm_runtime,
+        gpu_architecture=amd_arch,
+        validation_level=("detected_only" if has_amd and vllm_runtime == "rocm" else None),
         libs=vllm_libs,
     )
     # vLLM-CPU: the same package built against a CPU-only torch.
     out["vllm-cpu"] = BackendAvailability(
         name="vllm-cpu",
-        available=bool(vllm_importable and torch_cuda is False),
+        available=bool(vllm_importable and vllm_runtime == "cpu"),
         version=vllm_ver,
         libs=dict(vllm_libs),
         reason=(
             "vllm not importable" if not vllm_importable
-            else ("torch is a CUDA build; vLLM-CPU needs the CPU wheel" if torch_cuda else None)
+            else ("torch is an accelerator build; vLLM-CPU needs the CPU wheel" if vllm_runtime != "cpu" else None)
         ),
+        runtime=vllm_runtime,
     )
 
     sgl_python = sglang_python()
     sgl_ver = _sglang_version(sgl_python) if sgl_python else None
     sgl_found = sgl_python is not None and (sgl_python == sys.executable or sgl_ver is not None)
+    sgl_runtime = _torch_runtime(sgl_python) if has_amd and sgl_found else None
+    sgl_rocm_ok = has_amd and sgl_runtime == "rocm" and amd_arch_supported
+    sgl_nvidia_ok = has_nvidia and sgl_runtime in (None, "cuda")
+    if not sgl_found:
+        sgl_reason = "sglang not found: install it here, or set $SGLANG_PYTHON to the python of an environment that has it"
+    elif sgl_runtime == "cpu":
+        sgl_reason = "SGLang's PyTorch is a CPU build"
+    elif has_amd and sgl_runtime == "rocm" and not amd_arch_supported:
+        sgl_reason = f"unsupported or unknown AMD GPU architecture for ROCm SGLang: {amd_arch or 'unknown'}"
+    elif has_amd and not has_nvidia and sgl_runtime != "rocm":
+        sgl_reason = "SGLang's PyTorch is not a ROCm build for the visible AMD GPU"
+    elif has_nvidia and sgl_runtime == "rocm" and not sgl_rocm_ok:
+        sgl_reason = "SGLang's PyTorch is a ROCm build but no supported AMD GPU is visible"
+    elif not sgl_nvidia_ok and not sgl_rocm_ok:
+        sgl_reason = "no usable NVIDIA GPU (check CUDA_VISIBLE_DEVICES)"
+    else:
+        sgl_reason = None
     out["sglang"] = BackendAvailability(
         name="sglang",
-        available=bool(sgl_found and has_nvidia),
+        available=bool(sgl_found and (sgl_nvidia_ok or sgl_rocm_ok)),
         version=sgl_ver,
+        runtime=sgl_runtime,
+        gpu_architecture=amd_arch,
+        validation_level=("detected_only" if has_amd and sgl_runtime == "rocm" else None),
         libs=_sglang_libs(sgl_python) if sgl_python and sgl_ver else {},
-        reason=("sglang not found: install it here, or set $SGLANG_PYTHON to the python of an environment that has it"
-                if not sgl_found
-                else ("no usable NVIDIA GPU (check CUDA_VISIBLE_DEVICES)" if not has_nvidia else None)),
+        reason=sgl_reason,
     )
 
     llama_variants = (
@@ -853,7 +928,11 @@ def probe_backends(gpus: List[GPUInfo]) -> Dict[str, BackendAvailability]:
             reason = f"llama-server does not list a visible GPU for {label}"
         else:
             reason = None
-        out[name] = BackendAvailability(name=name, available=reason is None, version=ver, reason=reason)
+        out[name] = BackendAvailability(
+            name=name, available=reason is None, version=ver, reason=reason,
+            gpu_architecture=(amd_arch if has_amd and runtime in ("hip", "vulkan") else None),
+            validation_level=("detected_only" if has_amd and runtime in ("hip", "vulkan") and reason is None else None),
+        )
 
     binary = llama_server_binary()
     if binary:
@@ -889,7 +968,11 @@ def hardware_hash(hw: HardwareDescriptor) -> str:
     """
     parts = []
     for g in hw.gpus:
-        parts.append(f"gpu:{g.vendor}:{g.name}:{g.cc[0]}.{g.cc[1]}:{g.architecture or ''}:"
+        # Keep the pre-AMD NVIDIA shape unchanged so adding optional device metadata does not invalidate
+        # existing hardware-keyed profiles. AMD needs its ROCm target in the key because two cards with the
+        # same marketing name can expose different supported engine and kernel sets.
+        architecture = f":{g.architecture or ''}" if g.vendor == "amd" else ""
+        parts.append(f"gpu:{g.vendor}:{g.name}:{g.cc[0]}.{g.cc[1]}{architecture}:"
                      f"{g.vram_total_bytes // (256 * 1024 * 1024)}")
     c = hw.cpu
     parts.append(f"cpu:{c.model_name}:{c.physical_cores}:{c.logical_cores}:{int(c.avx2)}{int(c.avx512)}")

@@ -65,6 +65,64 @@ def test_an_environment_that_cannot_answer_has_no_version_and_no_libraries(monke
     assert sgl.version is None and sgl.libs == {} and not sgl.available
 
 
+def test_profiles_invalidate_when_torch_switches_between_cuda_and_rocm(hw_a100, prepared_vllm):
+    recorded = hw_a100.model_copy(deep=True)
+    present = hw_a100.model_copy(deep=True)
+    recorded.backends["vllm"] = recorded.backends["vllm"].model_copy(update={"runtime": "cuda"})
+    present.backends["vllm"] = present.backends["vllm"].model_copy(update={"runtime": "rocm"})
+    profile = _libs_profile(recorded, {"torch": "2.13.0"}, prepared_vllm.arch)
+    assert "PyTorch runtime cuda -> rocm" in invalid_reason(profile, present)
+
+
+def test_profile_marks_rocm_detection_and_completed_hardware_trial(hw_rx7900xt, spec, prepared_vllm):
+    from rigtune.backends.base import LaunchSpec
+    from rigtune.models import GPUInfo, TrialMetrics, TrialResult
+    from rigtune.pipeline import _profile_for
+
+    gpu = GPUInfo(vendor="amd", name="AMD Radeon RX 7900 XT", index=1, pci_bus_id="0000:15:00.0",
+                  architecture="gfx1100", vram_total_bytes=20 * 1024**3)
+    backends = dict(hw_rx7900xt.backends)
+    backends["vllm"] = BackendAvailability(name="vllm", available=True, version="0.16.0", runtime="rocm",
+                                            gpu_architecture="gfx1100", validation_level="detected_only")
+    hw = hw_rx7900xt.model_copy(update={"gpus": [gpu], "backends": backends})
+
+    class StubBackend:
+        name = "vllm"
+
+        def launch_spec(self, config, prepared, port):
+            return LaunchSpec(args=["vllm", "serve", prepared.spec.hf_id, str(port)])
+
+        def version(self, _hw):
+            return "0.16.0"
+
+    cfg = Config(backend="vllm", quant="bf16")
+    detected = _profile_for(hw, spec, "balanced", StubBackend(), cfg, prepared_vllm)
+    assert detected.validation_level == "detected_only"
+    trial = TrialResult(config=cfg, stage="confirm", metrics=TrialMetrics(tok_s=1, requests=1, output_tokens=1))
+    measured = _profile_for(hw, spec, "balanced", StubBackend(), cfg, prepared_vllm, table=[trial])
+    assert measured.engine_runtime == "rocm"
+    assert measured.gpu_architecture == "gfx1100"
+    assert measured.validation_level == "hardware_trial_completed"
+    assert measured.model_dump()["validation_level"] == "hardware_trial_completed"
+
+
+def test_unset_runtime_and_thermal_fields_are_omitted_from_legacy_json():
+    from rigtune.models import BackendAvailability, TrialMetrics
+
+    backend = BackendAvailability(name="vllm", available=True)
+    metrics = TrialMetrics()
+    assert "runtime" not in backend.model_dump(mode="json")
+    assert "gpu_architecture" not in backend.model_dump(mode="json")
+    assert "junction_temp_min_c" not in metrics.model_dump(mode="json")
+    assert "thermal_limit_hit" not in metrics.model_dump(mode="json")
+
+    measured = TrialMetrics(junction_temp_min_c=94.0, junction_temp_peak_c=97.0,
+                            thermal_limit_hit=True, thermal_limit_c=96.0)
+    data = measured.model_dump(mode="json")
+    assert data["junction_temp_min_c"] == 94.0 and data["junction_temp_peak_c"] == 97.0
+    assert data["thermal_limit_hit"] is True and data["thermal_limit_c"] == 96.0
+
+
 def test_the_question_runs_in_a_real_interpreter():
     """The code another environment runs, run here: one JSON line, null for what is not installed."""
     out = subprocess.run([sys.executable, "-c", H._VERSIONS_CODE, "pip", "no-such-distribution-here"],

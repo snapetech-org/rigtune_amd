@@ -53,9 +53,18 @@ def _fmt(x: Optional[float], nd: int = 1, suffix: str = "") -> str:
     return f"{x:.{nd}f}{suffix}"
 
 
+def _junction_range(low: Optional[float], high: Optional[float]) -> str:
+    if low is None and high is None:
+        return "-"
+    if low is None or high is None or low == high:
+        return _fmt(high if high is not None else low, 1)
+    return f"{_fmt(low, 1)}–{_fmt(high, 1)}"
+
+
 def _trial_table(results: List[TrialResult], winner: Optional[str] = None) -> Table:
     t = Table(title="Calibration", show_lines=False)
-    for col in ("stage", "config", "tok/s", "TTFT ms", "TPOT ms", "peak MB", "W", "MHz", "J/tok", "status"):
+    for col in ("stage", "config", "tok/s", "TTFT ms", "TPOT ms", "peak MB", "W", "MHz", "junction C",
+                "J/tok", "status"):
         t.add_column(col, justify="right" if col not in ("stage", "config", "status") else "left",
                      overflow="fold", min_width=(40 if col == "config" else None))
     for r in results:
@@ -64,7 +73,9 @@ def _trial_table(results: List[TrialResult], winner: Optional[str] = None) -> Ta
         key = _trial_key(r)
         style = "bold green" if winner and key == winner else None
         t.add_row(r.stage, key, _fmt(m.tok_s), _fmt(m.ttft_ms, 0), _fmt(m.tpot_ms, 1), _fmt(m.peak_mem_mb, 0),
-                  _fmt(m.power_w, 0), _fmt(m.sm_clock_mhz, 0), _fmt(m.joules_per_token, 3), status, style=style)
+                  _fmt(m.power_w, 0), _fmt(m.sm_clock_mhz, 0),
+                  _junction_range(m.junction_temp_min_c, m.junction_temp_peak_c),
+                  _fmt(m.joules_per_token, 3), status, style=style)
     return t
 
 
@@ -81,6 +92,15 @@ def _print_profile(p: Profile) -> None:
     found = p.hardware.backends.get(p.backend)
     libs = ", ".join(f"{k} {v}" for k, v in sorted(found.libs.items())) if found is not None else ""
     console.print(f"[bold]backend[/]: {p.backend} {p.backend_version or ''}" + (f"  [dim]({libs})[/]" if libs else ""))
+    if p.engine_runtime:
+        console.print(f"[bold]runtime[/]: {p.engine_runtime}")
+    if p.gpu_architecture:
+        console.print(f"[bold]GPU architecture[/]: {p.gpu_architecture}")
+    if p.validation_level:
+        validation = {"detected_only": "detected; no hardware trial completed",
+                      "hardware_trial_completed": "hardware trial completed"}.get(p.validation_level,
+                                                                                     p.validation_level)
+        console.print(f"[bold]validation[/]: {validation}")
     console.print(f"[bold]config[/]:  {p.config.key()}")
     if p.disagg is not None:
         console.print(f"[bold]phases[/]:  disaggregated over {p.disagg.connector}; "
@@ -123,8 +143,10 @@ def _progress_line(stage: str, cfg, res, objective: Optional[str] = None, cons=N
             verdict = "" if ranked[0].feasible else "  [yellow]breaks the limits at every level[/]"
     p95 = f" (p95 {_fmt(m.ttft_p95_ms, 0)})" if m.ttft_p95_ms is not None else ""
     energy = f"  {_fmt(m.joules_per_token, 3)} J/tok" if m.joules_per_token else ""
+    junction = (f"  {_junction_range(m.junction_temp_min_c, m.junction_temp_peak_c)} C junction"
+                if m.junction_temp_peak_c is not None else "")
     return (f"[green]{stage:>7}[/] {cfg.key()}  {m.tok_s:.1f} tok/s at {m.concurrency} users  "
-            f"TTFT {_fmt(m.ttft_ms, 0)} ms{p95}{energy}{verdict}")
+            f"TTFT {_fmt(m.ttft_ms, 0)} ms{p95}{junction}{energy}{verdict}")
 
 
 def _progress(stage: str, cfg, res) -> None:
@@ -285,7 +307,21 @@ def _power_controller(profile: Profile):
 
     if profile.disagg is not None:  # disaggregated: the decode GPU is the one that is capped
         return controller_for(profile.disagg.decode_gpu)
-    return controller_for(profile.hardware.gpu.index if profile.hardware.gpu else 0)
+    gpu = profile.hardware.gpu
+    if gpu is not None and gpu.vendor == "amd":
+        return controller_for(gpu.index, vendor="amd", pci_bus_id=gpu.pci_bus_id, hip_uuid=gpu.hip_uuid,
+                              junction_temp_limit_c=_profile_junction_limit(profile))
+    return controller_for(gpu.index if gpu else 0)
+
+
+def _profile_junction_limit(profile: Profile) -> Optional[float]:
+    value = profile.options.get("junction") if profile.options else None
+    if not value or not value.endswith("C"):
+        return None
+    try:
+        return float(value[:-1])
+    except ValueError:
+        return None
 
 
 WORKLOAD_OPT = typer.Option("default", "--workload", "-w", help="Workload preset; see `rigtune workloads`")
@@ -316,6 +352,21 @@ POWER_OPT = typer.Option(
     "off", "--power", callback=_power_mode,
     help="Energy tuning: off | cap (power limit) | clock (locked SM clock) | both. Needs root; machine-wide; "
          "restored on exit and by `rigtune power reset`.",
+)
+POWER_MIN_OPT = typer.Option(
+    None, "--power-min-w", min=1,
+    help="AMD cap tuning: lowest PPT0 cap included in the sweep. Requires --power cap or both; all bounds are "
+         "checked against the selected GPU before model download.",
+)
+POWER_MAX_OPT = typer.Option(
+    None, "--power-max-w", min=1,
+    help="AMD cap tuning: highest PPT0 cap included in the sweep. The original cap remains the baseline and is "
+         "never raised by generated candidates.",
+)
+MAX_JUNCTION_OPT = typer.Option(
+    None, "--max-junction-temp-c", min=0.1,
+    help="Opt-in AMD calibration guard: stop the active trial at or above this junction temperature. Requires "
+         "--power cap or both, root access, and a readable hotspot sensor; this is not a live serving limiter.",
 )
 
 
@@ -444,7 +495,8 @@ def _opts(quant: str, kv_quant: str, speculative: str, prefix_cache: str, combin
           arrival_rate: Optional[float] = None, rate_check: str = "on",
           confirm_rounds: int = 1, min_requests: Optional[int] = None, eval_attempts: int = 3,
           drafts: str = "table", draft: Optional[str] = None, hub: str = "on",
-          kernel: Optional[str] = None):
+          kernel: Optional[str] = None, max_junction_temp_c: Optional[float] = None,
+          power_min_w: Optional[int] = None, power_max_w: Optional[int] = None):
     from rigtune.pipeline import SearchOptions
 
     if eval_set:
@@ -464,6 +516,8 @@ def _opts(quant: str, kv_quant: str, speculative: str, prefix_cache: str, combin
         arrival_rate=arrival_rate, rate_check=rate_check == "on",
         confirm_rounds=confirm_rounds, min_requests=min_requests, eval_attempts=eval_attempts,
         drafts=drafts, draft=draft, hub=hub, kernel=kernel,
+        max_junction_temp_c=max_junction_temp_c,
+        power_min_w=power_min_w, power_max_w=power_max_w,
     )
 
 
@@ -955,6 +1009,9 @@ def bench(
     tok_s_floor: Optional[float] = typer.Option(None, help="latency/efficiency: absolute tok/s floor"),
     save: bool = typer.Option(False, "--save", help="Also write the winning profile to the cache"),
     power: str = POWER_OPT,
+    max_junction_temp_c: Optional[float] = MAX_JUNCTION_OPT,
+    power_min_w: Optional[int] = POWER_MIN_OPT,
+    power_max_w: Optional[int] = POWER_MAX_OPT,
     tpot_ceiling: Optional[float] = TPOT_OPT,
     phases: str = PHASES_OPT,
     kv_connector: str = KV_OPT,
@@ -994,6 +1051,8 @@ def bench(
         check_goal_measurable,
         prepare_and_plan,
         select,
+        validate_power_bounds,
+        validate_junction_guard,
     )
 
     wl = _workload(workload, workload_file, sessions, session_pool, session_turns, history, session_system)
@@ -1017,10 +1076,14 @@ def bench(
                  eval_attempts=eval_attempts,
                  report_reuse=report_reuse, kv_tier=kv_tier, arrival_rate=arrival_rate, rate_check=rate_check,
                  confirm_rounds=confirm_rounds, min_requests=min_requests, drafts=drafts, draft=draft, hub=hub,
-                 kernel=kernel)
+                 kernel=kernel, max_junction_temp_c=max_junction_temp_c,
+                 power_min_w=power_min_w, power_max_w=power_max_w)
     try:  # as resolve_profile does: refused before the weights download and the search runs
         check_distributed_options(opts, hw, layout, phases)
         check_goal_measurable(objective, cons, opts, hw, layout, phases)
+        validate_power_bounds(hw, power, opts.power_min_w, opts.power_max_w)
+        validate_junction_guard(hw, power, opts.max_junction_temp_c, layout, phases,
+                                power_min_w=opts.power_min_w, power_max_w=opts.power_max_w)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     if layout != "single" and opts.kv_tier != "off":  # as pipeline._resolve_layout does
@@ -1073,6 +1136,9 @@ def recalibrate(
     ttft_percentile: int = TTFT_PCT_OPT,
     tok_s_floor: Optional[float] = typer.Option(None),
     power: str = POWER_OPT,
+    max_junction_temp_c: Optional[float] = MAX_JUNCTION_OPT,
+    power_min_w: Optional[int] = POWER_MIN_OPT,
+    power_max_w: Optional[int] = POWER_MAX_OPT,
     tpot_ceiling: Optional[float] = TPOT_OPT,
     phases: str = PHASES_OPT,
     kv_connector: str = KV_OPT,
@@ -1123,7 +1189,8 @@ def recalibrate(
                  eval_attempts=eval_attempts,
                  report_reuse=report_reuse, kv_tier=kv_tier, arrival_rate=arrival_rate, rate_check=rate_check,
                  confirm_rounds=confirm_rounds, min_requests=min_requests, drafts=drafts, draft=draft, hub=hub,
-                 kernel=kernel), layout=layout)
+                 kernel=kernel, max_junction_temp_c=max_junction_temp_c,
+                 power_min_w=power_min_w, power_max_w=power_max_w), layout=layout)
     view.stop()
     console.print(_trial_table(profile.calibration_table, winner=_winner_key(profile)))
     _print_profile(profile)
@@ -1196,6 +1263,9 @@ def compare(
     ttft_percentile: int = TTFT_PCT_OPT,
     tok_s_floor: Optional[float] = typer.Option(None),
     power: str = POWER_OPT,
+    max_junction_temp_c: Optional[float] = MAX_JUNCTION_OPT,
+    power_min_w: Optional[int] = POWER_MIN_OPT,
+    power_max_w: Optional[int] = POWER_MAX_OPT,
     tpot_ceiling: Optional[float] = TPOT_OPT,
     phases: str = PHASES_OPT,
     kv_connector: str = KV_OPT,
@@ -1287,7 +1357,8 @@ def compare(
                  eval_attempts=eval_attempts,
                  report_reuse=report_reuse, kv_tier=kv_tier, arrival_rate=arrival_rate, rate_check=rate_check,
                  confirm_rounds=confirm_rounds, min_requests=min_requests, drafts=drafts, draft=draft, hub=hub,
-                 kernel=kernel), layout=layout)
+                 kernel=kernel, max_junction_temp_c=max_junction_temp_c,
+                 power_min_w=power_min_w, power_max_w=power_max_w), layout=layout)
     view.stop()
     _print_profile(profile)
     # Compare the checked target commit, including stock rows prepared on another backend.
@@ -1630,6 +1701,9 @@ def serve(
     ttft_percentile: int = TTFT_PCT_OPT,
     tok_s_floor: Optional[float] = typer.Option(None, help="latency/efficiency: absolute tok/s floor"),
     power: str = POWER_OPT,
+    max_junction_temp_c: Optional[float] = MAX_JUNCTION_OPT,
+    power_min_w: Optional[int] = POWER_MIN_OPT,
+    power_max_w: Optional[int] = POWER_MAX_OPT,
     tpot_ceiling: Optional[float] = TPOT_OPT,
     phases: str = PHASES_OPT,
     kv_connector: str = KV_OPT,
@@ -1728,7 +1802,8 @@ def serve(
                  eval_attempts=eval_attempts,
                  report_reuse=report_reuse, kv_tier=kv_tier, arrival_rate=arrival_rate, rate_check=rate_check,
                  confirm_rounds=confirm_rounds, min_requests=min_requests, drafts=drafts, draft=draft, hub=hub,
-                 kernel=kernel), layout=layout)
+                 kernel=kernel, max_junction_temp_c=max_junction_temp_c,
+                 power_min_w=power_min_w, power_max_w=power_max_w), layout=layout)
     view.stop()
     _print_profile(profile)
     if profile.prepared is None:
@@ -1805,19 +1880,27 @@ def power_status() -> None:
 
     hw = _probe()
     if hw.gpu is None:
-        err.print("[red]no visible GPU; power tuning needs an NVIDIA GPU[/]")
+        err.print("[red]no visible GPU; power tuning needs a supported NVIDIA or AMD GPU[/]")
         raise typer.Exit(1)
     try:
-        caps = P.controller_for(hw.gpu.index).capabilities()
+        if hw.gpu.vendor == "amd":
+            ctl = P.controller_for(hw.gpu.index, vendor="amd", pci_bus_id=hw.gpu.pci_bus_id,
+                                   hip_uuid=hw.gpu.hip_uuid)
+        else:
+            ctl = P.controller_for(hw.gpu.index)
+        caps = ctl.capabilities()
     except P.PowerControlUnavailable as exc:
         err.print(f"[red]{exc}[/]")
         raise typer.Exit(1)
-    console.print(f"[bold]GPU {caps.gpu_index}[/]: {hw.gpu.name}")
+    identity = f" ({hw.gpu.pci_bus_id})" if hw.gpu.pci_bus_id else ""
+    console.print(f"[bold]GPU {caps.gpu_index}[/]: {hw.gpu.name}{identity} [{hw.gpu.vendor.upper()}]")
     console.print(f"power limit: default {caps.power_limit_default_w} W, current {caps.power_limit_current_w} W, "
                   f"allowed {caps.power_limit_min_w}-{caps.power_limit_max_w} W")
     if caps.sm_clocks_mhz:
         console.print(f"SM clocks: {caps.sm_clocks_mhz[-1]}-{caps.sm_clocks_mhz[0]} MHz "
                       f"({len(caps.sm_clocks_mhz)} steps), max {caps.sm_clock_max_mhz} MHz")
+    if caps.junction_slowdown_c is not None:
+        console.print(f"junction slowdown threshold: {caps.junction_slowdown_c} C")
     for knob, ok in (("cap", caps.can_cap), ("clock", caps.can_lock)):
         why = "" if ok else f"  ({caps.reasons.get(knob, 'unknown')})"
         console.print(f"{'power capping' if knob == 'cap' else 'clock locking'}: "
@@ -1839,8 +1922,11 @@ def power_reset(gpu: Optional[int] = typer.Option(None, "--gpu", help="GPU index
         err.print(f"[red]{exc}[/]")
         raise typer.Exit(1)
     if state:
-        console.print(f"restored GPU {state.get('gpu_index')} power limit to {int(state['power_limit_mw']) // 1000} W "
-                      "and unlocked clocks")
+        watts = (int(state["power_limit_w"]) if "power_limit_w" in state
+                 else int(state.get("power_limit_mw", 0)) // 1000)
+        console.print(f"restored GPU {state.get('gpu_index')} power limit to {watts} W")
+        if state.get("vendor") != "amd":
+            console.print("unlocked clocks")
     else:
         console.print("no recorded change; unlocked clocks anyway")
 

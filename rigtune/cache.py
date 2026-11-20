@@ -134,10 +134,14 @@ def library_changes(profile: Profile, hw: HardwareDescriptor) -> Tuple[List[str]
     present = hw.backends.get(profile.backend)
     old = recorded.libs if recorded is not None else {}
     new = present.libs if present is not None else {}
-    if not old or not new:
-        return [], []
     changed: List[str] = []
     patch: List[str] = []
+    old_runtime = recorded.runtime if recorded is not None else None
+    new_runtime = present.runtime if present is not None else None
+    if old_runtime is not None and new_runtime is not None and old_runtime != new_runtime:
+        changed.append(f"PyTorch runtime {old_runtime} -> {new_runtime}")
+    if not old or not new:
+        return changed, patch
     for name in sorted(set(old) | set(new)):
         a, b = old.get(name), new.get(name)
         if a == b:

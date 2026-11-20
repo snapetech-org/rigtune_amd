@@ -101,12 +101,39 @@ def test_the_docker_image_opts_back_in_to_every_interface():
     assert "ENV RIGTUNE_HOST=0.0.0.0" in dockerfile
 
 
+def test_install_and_rocm_container_guidance_match_project_metadata():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    dockerfile = (root / "Dockerfile.rocm").read_text(encoding="utf-8")
+    assert 'name = "rigtune-amd"' in pyproject
+    assert 'rigtune = "rigtune.cli:app"' in pyproject
+    assert 'rigtune-amd = "rigtune.cli:app"' in pyproject
+    assert "python -m pip install -e ." in readme
+    assert "FROM ${BASE_IMAGE}" in dockerfile and "rocm/vllm-dev:" in dockerfile
+    assert "--device=/dev/kfd" in readme and "--device=/dev/dri" in readme
+
+
 def test_the_accuracy_gate_options_reach_the_search_options():
     from rigtune.cli import _opts
 
     opts = _opts("auto", "on", "on", "on", eval_set="gsm8k", max_accuracy_loss=5.0, eval_items=0)
     assert (opts.eval_set, opts.max_accuracy_loss, opts.eval_items) == ("gsm8k", 5.0, 0)
     assert _opts("auto", "on", "on", "on").eval_set is None
+
+
+def test_amd_power_bounds_reach_search_options_and_all_calibrating_commands():
+    import typer.main
+
+    from rigtune.cli import _opts
+
+    opts = _opts("auto", "on", "on", "on", power_min_w=150, power_max_w=220)
+    assert (opts.power_min_w, opts.power_max_w) == (150, 220)
+    for command in ("bench", "recalibrate", "compare", "serve"):
+        params = {p.name for p in typer.main.get_command(app).commands[command].params}
+        assert {"power_min_w", "power_max_w", "max_junction_temp_c"} <= params
 
 
 def test_a_bad_eval_set_fails_before_anything_runs(tmp_path):

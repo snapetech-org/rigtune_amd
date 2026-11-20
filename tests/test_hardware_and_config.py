@@ -168,3 +168,52 @@ def test_backend_reasons_explain_a_masked_gpu(monkeypatch):
     out = probe_backends([])  # no visible GPUs
     assert not out["vllm"].available and "NVIDIA" in out["vllm"].reason
     assert not out["sglang"].available and "NVIDIA" in out["sglang"].reason
+
+
+def test_backend_probe_distinguishes_rocm_torch_from_cuda_and_cpu(monkeypatch):
+    from rigtune.hardware import probe_backends
+    from rigtune.models import GPUInfo
+
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object() if name in ("torch", "vllm", "sglang")
+                        else None)
+    monkeypatch.setattr("rigtune.hardware._pkg_version", lambda name: "1.0" if name in ("vllm", "sglang") else None)
+    monkeypatch.setattr("rigtune.hardware._sglang_version", lambda _python: "1.0")
+    monkeypatch.setattr("rigtune.hardware._torch_runtime", lambda _python=None: "rocm")
+    amd = GPUInfo(vendor="amd", name="AMD Radeon RX 7900 XT", index=1, architecture="gfx1100")
+    found = probe_backends([amd])
+    assert found["vllm"].available and found["vllm"].runtime == "rocm"
+    assert found["sglang"].available and found["sglang"].runtime == "rocm"
+    assert found["vllm"].gpu_architecture == "gfx1100"
+    assert found["vllm"].validation_level == "detected_only"
+
+    unknown_arch = amd.model_copy(update={"architecture": "gfx9999"})
+    found = probe_backends([unknown_arch])
+    assert not found["vllm"].available and "unsupported or unknown AMD GPU architecture" in found["vllm"].reason
+    assert not found["sglang"].available and "unsupported or unknown AMD GPU architecture" in found["sglang"].reason
+
+    monkeypatch.setattr("rigtune.hardware._torch_runtime", lambda _python=None: "cpu")
+    found = probe_backends([amd])
+    assert found["vllm-cpu"].available
+    assert not found["vllm"].available and "CPU build" in found["vllm"].reason
+    assert not found["sglang"].available and "CPU build" in found["sglang"].reason
+
+    monkeypatch.setattr("rigtune.hardware._torch_runtime", lambda _python=None: "cuda")
+    found = probe_backends([amd])
+    assert not found["vllm"].available and "not a ROCm build" in found["vllm"].reason
+    assert not found["sglang"].available and "not a ROCm build" in found["sglang"].reason
+
+
+def test_nvidia_hardware_hash_remains_compatible_with_existing_profiles(hw_a100):
+    from rigtune.hardware import hardware_hash
+
+    assert hardware_hash(hw_a100) == "23b55d8b4f1b7839"
+
+
+def test_amd_architecture_is_included_in_hardware_hash(hw_rx7900xt):
+    from rigtune.hardware import hardware_hash
+
+    with_arch = hw_rx7900xt.model_copy(deep=True)
+    without_arch = hw_rx7900xt.model_copy(deep=True)
+    with_arch.gpu.architecture = "gfx1100"
+    without_arch.gpu.architecture = "gfx1101"
+    assert hardware_hash(with_arch) != hardware_hash(without_arch)

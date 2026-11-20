@@ -28,6 +28,7 @@ import logging
 import math
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,7 +100,7 @@ STARTUP_CAUSES = (MM_PROFILING_FAILED, LOAD_FAILED, SUFFIX_FAILED, ARCTIC_PLUGIN
 #   kernel_refused     the engine exited at start-up naming a kernel setting of the config (Config.kernels)
 FAILURE_KINDS = ("oom_startup", "mm_profiling", "load_failure", "suffix_unusable", "arctic_plugin", "startup_other",
                  "power_unavailable", "request_failures", "crashed", "skipped_budget", "skipped_blocked",
-                 "draft_refused", "draft_unavailable", "kernel_refused")
+                 "draft_refused", "draft_unavailable", "kernel_refused", "thermal_limit")
 _CAUSE_KINDS = {MM_PROFILING_FAILED: "mm_profiling", LOAD_FAILED: "load_failure", SUFFIX_FAILED: "suffix_unusable",
                 ARCTIC_PLUGIN_FAILED: "arctic_plugin", SUFFIX_TRIAL_ERROR: "startup_other"}
 BUDGET_SKIPPED = "skipped: calibration budget reached"
@@ -564,6 +565,10 @@ class SubprocessTrialRunner:
                 f"http://127.0.0.1:{port}", hooks, self.workload, pid=proc.pid,
                 request_timeout=self.request_timeout, enough=self.enough, close_call=self.close_call,
                 idle_tail_s=self.idle_tail_s, arrival_rate=arrival_rate, answers=self.answers,
+                junction_temp_limit_c=getattr(self.power, "junction_temp_limit_c", None),
+                on_thermal_limit=(lambda _temp: threading.Thread(
+                    target=lambda: proc.stop(grace=0.5), name="rigtune-thermal-stop", daemon=True).start())
+                if getattr(self.power, "junction_temp_limit_c", None) is not None else None,
                 **({"on_level": self.on_level} if self.on_level is not None else {}),
             )
             if spec_window is not None and metrics.ok:
@@ -579,12 +584,20 @@ class SubprocessTrialRunner:
                 # Same warm engine, after the log is read: grading traffic would push its memory lines out of the tail.
                 self.gate.record(f"http://127.0.0.1:{port}", hooks.model_name, cfg)
             err = None
-            if not metrics.ok:
+            failure_kind = None
+            if metrics.thermal_limit_hit:
+                peak = metrics.junction_temp_peak_c
+                limit = metrics.thermal_limit_c
+                err = (f"junction temperature {peak:g} C reached the configured guard of {limit:g} C"
+                       if peak is not None and limit is not None else "junction temperature guard stopped this trial")
+                failure_kind = "thermal_limit"
+            elif not metrics.ok:
                 err = metrics.failure_summary()
+                failure_kind = "request_failures" if err else None
             elif metrics.failed:
                 logger.info("%s: tolerated %d/%d failed requests", cfg.key(), metrics.failed, metrics.requests)
             return TrialResult(config=cfg, stage=stage, metrics=metrics, error=err, memory=observation,
-                               failure_kind="request_failures" if err else None)
+                               failure_kind=failure_kind)
         except Exception as exc:
             if getattr(model, "spec_paths", {}):
                 from rigtune.pairing import redact_paths
@@ -658,10 +671,23 @@ class SubprocessTrialRunner:
                     try:
                         metrics = run_trial(f"http://127.0.0.1:{port}", hooks,
                                             _point_workload(self.workload, i, len(settings)), pid=proc.pid,
-                                            request_timeout=self.request_timeout, idle_tail_s=self.idle_tail_s)
-                        err = None if metrics.ok else metrics.failure_summary()
+                                            request_timeout=self.request_timeout, idle_tail_s=self.idle_tail_s,
+                                            junction_temp_limit_c=getattr(self.power, "junction_temp_limit_c", None),
+                                            on_thermal_limit=(lambda _temp: threading.Thread(
+                                                target=lambda: proc.stop(grace=0.5),
+                                                name="rigtune-thermal-stop", daemon=True).start())
+                                            if getattr(self.power, "junction_temp_limit_c", None) is not None else None)
+                        if metrics.thermal_limit_hit:
+                            peak, limit = metrics.junction_temp_peak_c, metrics.thermal_limit_c
+                            err = (f"junction temperature {peak:g} C reached the configured guard of {limit:g} C"
+                                   if peak is not None and limit is not None else
+                                   "junction temperature guard stopped this trial")
+                            failure_kind = "thermal_limit"
+                        else:
+                            err = None if metrics.ok else metrics.failure_summary()
+                            failure_kind = "request_failures" if err else None
                         res = TrialResult(config=cfg, stage=stage, metrics=metrics, error=err,
-                                          failure_kind="request_failures" if err else None)
+                                          failure_kind=failure_kind)
                     except Exception as exc:
                         if private_paths:
                             logger.error("power point %s crashed: %s", cfg.key(), redact_paths(str(exc), private_paths))
@@ -673,6 +699,15 @@ class SubprocessTrialRunner:
                 results.append(res)
                 if progress:
                     progress(stage, cfg, res)
+                if res.failure_kind == "thermal_limit":
+                    for remaining in settings[i + 1:]:
+                        skipped_cfg = with_power(base, remaining)
+                        results.append(TrialResult(config=skipped_cfg, stage=stage, metrics=TrialMetrics(),
+                                                   launched=False,
+                                                   error="not measured because the junction temperature guard stopped "
+                                                         "the power sweep",
+                                                   failure_kind="thermal_limit"))
+                    break
             return results
         finally:
             self._restore_power()

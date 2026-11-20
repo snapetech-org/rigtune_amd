@@ -311,6 +311,53 @@ def test_gpu_state_reads_power_limit_and_temperature_and_never_fails(monkeypatch
     assert gpu_state() == []
 
 
+def test_gpu_state_records_amd_cap_and_junction_sensor(monkeypatch):
+    import json
+    import rigtune.amd as amd
+    import rigtune.hardware as hardware
+    from rigtune.amd import AmdGpuReading
+    from rigtune.bench.compare import gpu_state
+
+    monkeypatch.setattr(hardware, "_amd_smi_binary", lambda: "amd-smi")
+    monkeypatch.setattr(amd, "read_sysfs_metrics", lambda _bdf: AmdGpuReading(
+        memory_used_mb=4096, utilization_pct=75, power_w=220, clock_mhz=2300, junction_temp_c=96.5))
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "amd-smi" and cmd[1] == "list":
+            return subprocess.CompletedProcess(cmd, 0, json.dumps([{
+                "gpu": 1, "bdf": "0000:15:00.0", "hip_id": 1, "hip_uuid": "GPU-test",
+            }]), "")
+        if cmd[0] == "amd-smi" and cmd[1] == "static":
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"gpu_data": [{
+                "gpu": 1, "limit": {"ppt0": {"socket_power_limit": {"value": 231}}},
+            }]}), "")
+        raise FileNotFoundError("nvidia-smi is absent")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert gpu_state() == [{
+        "vendor": "amd", "index": 1, "pci_bus_id": "0000:15:00.0", "power_limit_w": 231,
+        "temperature_c": 96.5, "junction_temp_c": 96.5, "power_w": 220,
+        "sm_clock_mhz": 2300, "memory_used_mb": 4096, "gpu_util_pct": 75,
+    }]
+
+
+def test_amd_provenance_identifies_selected_gpu_and_marks_detection_only():
+    hw = make_hw("rx7900xt")
+    gpu = hw.gpu.model_copy(update={"pci_bus_id": "0000:15:00.0", "architecture": "gfx1100"})
+    backends = dict(hw.backends)
+    backends["vllm"] = backends["vllm"].model_copy(update={
+        "available": True, "runtime": "rocm", "gpu_architecture": "gfx1100", "validation_level": "detected_only",
+    })
+    hw = hw.model_copy(update={"gpus": [gpu], "backends": backends})
+    record = provenance(hw, {})
+    assert record["selected_gpu"] == {"vendor": "amd", "index": 1, "name": "AMD Radeon RX 7900 XT",
+                                      "pci_bus_id": "0000:15:00.0", "architecture": "gfx1100"}
+    assert record["gpus"][0]["pci_bus_id"] == "0000:15:00.0"
+    assert record["engines"]["vllm"]["runtime"] == "rocm"
+    assert record["engines"]["vllm"]["gpu_architecture"] == "gfx1100"
+    assert record["engines"]["vllm"]["validation_level"] == "detected_only"
+
+
 @pytest.mark.usefixtures("no_network")
 def test_each_run_records_the_gpus_at_its_start_its_engine_logs_and_its_requests(hw_a100, spec, monkeypatch,
                                                                                 tmp_path):

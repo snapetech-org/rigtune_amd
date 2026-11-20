@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from typing import List, Optional
 
 import pytest
@@ -104,6 +105,27 @@ class FakeController:
         self.history.append("restore")
 
 
+class FakeAmdSmi:
+    def __init__(self, current: int = 231, *, apply: bool = True):
+        self.current = current
+        self.apply_changes = apply
+        self.calls = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(list(cmd))
+        args = cmd[1:]
+        if args[0] == "static":
+            row = {"gpu": 1, "limit": {
+                "ppt0": {"min_power_limit": {"value": 120}, "max_power_limit": {"value": 290},
+                         "socket_power_limit": {"value": self.current}},
+                "slowdown_hotspot_temperature": {"value": 110},
+            }}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"gpu_data": [row]}), "")
+        if args[0] == "set" and self.apply_changes:
+            self.current = int(args[args.index("-o") + 1])
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+
 def _caps(can_cap: bool = True, can_lock: bool = True) -> Capabilities:
     return Capabilities(gpu_index=0, power_limit_min_w=100, power_limit_max_w=400, power_limit_default_w=DEFAULT_W,
                         power_limit_current_w=DEFAULT_W, sm_clocks_mhz=list(range(MAX_MHZ, 209, -15)),
@@ -165,6 +187,16 @@ def test_candidate_points_respect_limits_and_permissions():
     assert len(candidate_points(_caps(can_cap=False), "both")) == 4  # clocks still offered
 
 
+def test_candidate_points_apply_explicit_watt_bounds_without_raising_the_baseline():
+    caps = _caps()
+    bounded = candidate_points(caps, "cap", power_min_w=200, power_max_w=300)
+    assert bounded[0] == PowerSetting()
+    assert [p.power_limit_w for p in bounded[1:]] == [300, 285, 270, 255, 200]
+    assert candidate_points(caps, "cap", power_min_w=350, power_max_w=400) == [PowerSetting()]
+    with pytest.raises(ValueError, match="supported minimum"):
+        candidate_points(caps, "cap", power_min_w=50)
+
+
 # --------------------------------------------------------------------------- NVML controller
 
 
@@ -198,6 +230,99 @@ def test_nvml_controller_reports_missing_permission(tmp_home):
     assert "root" in caps.reasons["cap"] and "root" in caps.reasons["clock"]
     with pytest.raises(PowerControlUnavailable, match="root"):
         ctl.apply(PowerSetting(power_limit_w=245))
+
+
+def test_amd_smi_cap_is_selected_by_bdf_verified_and_restored(tmp_home):
+    smi = FakeAmdSmi()
+    ctl = P.AmdSmiPowerController(1, "0000:15:00.0", hip_uuid="GPU-test", binary="amd-smi", run=smi,
+                                  is_root=True)
+    caps = ctl.capabilities()
+    assert caps.can_cap and not caps.can_lock
+    assert (caps.power_limit_min_w, caps.power_limit_max_w, caps.power_limit_current_w) == (120, 290, 231)
+    assert caps.junction_slowdown_c == 110
+    assert all(call[1] == "static" for call in smi.calls)  # capability detection never writes a setting
+
+    ctl.apply(PowerSetting(power_limit_w=180))
+    state = json.loads(P.restore_path().read_text())
+    assert state == {"vendor": "amd", "gpu_index": 1, "pci_bus_id": "0000:15:00.0", "hip_uuid": "GPU-test",
+                     "power_limit_w": 231}
+    assert smi.current == 180
+    assert ["amd-smi", "set", "-g", "0000:15:00.0", "-o", "180", "ppt0", "--json"] in smi.calls
+
+    ctl.restore()
+    assert smi.current == 231 and P.pending_restore() is None
+
+
+def test_amd_smi_permission_and_invalid_range_are_read_only(tmp_home):
+    smi = FakeAmdSmi()
+    ctl = P.AmdSmiPowerController(1, "0000:15:00.0", binary="amd-smi", run=smi, is_root=False)
+    caps = ctl.capabilities()
+    assert not caps.can_cap and "root" in caps.reasons["cap"]
+    assert all(call[1] == "static" for call in smi.calls)
+    with pytest.raises(PowerControlUnavailable, match="root"):
+        ctl.apply(PowerSetting(power_limit_w=180))
+
+    root_ctl = P.AmdSmiPowerController(1, "0000:15:00.0", binary="amd-smi", run=smi, is_root=True)
+    with pytest.raises(PowerControlUnavailable, match="range"):
+        root_ctl.apply(PowerSetting(power_limit_w=100))
+
+
+def test_amd_smi_rejects_ambiguous_bdf_selection_response(tmp_home):
+    class AmbiguousAmdSmi(FakeAmdSmi):
+        def __call__(self, cmd, **kwargs):
+            result = super().__call__(cmd, **kwargs)
+            if cmd[1] == "static":
+                rows = json.loads(result.stdout)["gpu_data"]
+                rows.append(dict(rows[0]))
+                result.stdout = json.dumps({"gpu_data": rows})
+            return result
+
+    ctl = P.AmdSmiPowerController(1, "0000:15:00.0", binary="amd-smi", run=AmbiguousAmdSmi(), is_root=True)
+    with pytest.raises(PowerControlUnavailable, match="ambiguous response"):
+        ctl.capabilities()
+
+
+def test_amd_smi_failed_readback_keeps_restore_record(tmp_home):
+    smi = FakeAmdSmi(apply=False)
+    ctl = P.AmdSmiPowerController(1, "0000:15:00.0", binary="amd-smi", run=smi, is_root=True)
+    with pytest.raises(PowerControlUnavailable, match="did not apply"):
+        ctl.apply(PowerSetting(power_limit_w=180))
+    assert P.pending_restore()["power_limit_w"] == 231
+    ctl.restore()  # the setter was a no-op; readback confirms the original cap is already restored
+    assert P.pending_restore() is None
+
+
+def test_amd_failed_restore_preserves_recovery_record(tmp_home):
+    state = {"vendor": "amd", "gpu_index": 1, "pci_bus_id": "0000:15:00.0", "power_limit_w": 231}
+    P._write_restore(state)
+    smi = FakeAmdSmi(current=180, apply=False)
+    ctl = P.AmdSmiPowerController(1, "0000:15:00.0", binary="amd-smi", run=smi, is_root=True)
+    with pytest.raises(PowerControlUnavailable, match="did not apply"):
+        ctl.restore()
+    assert P.pending_restore() == state
+
+
+@pytest.mark.parametrize("state", [
+    {"vendor": "amd", "gpu_index": 0, "pci_bus_id": "0000:16:00.0", "power_limit_w": 231},
+    {"vendor": "nvidia", "gpu_index": 0, "power_limit_mw": 231000},
+])
+def test_amd_restore_never_clears_another_gpu_recovery_record(tmp_home, state):
+    P._write_restore(state)
+    ctl = P.AmdSmiPowerController(1, "0000:15:00.0", binary="amd-smi", run=FakeAmdSmi(), is_root=True)
+    with pytest.raises(PowerControlUnavailable, match="another GPU"):
+        ctl.restore()
+    assert P.pending_restore() == state
+
+
+def test_reset_from_file_restores_amd_original_and_checks_gpu(tmp_home):
+    state = {"vendor": "amd", "gpu_index": 1, "pci_bus_id": "0000:15:00.0", "power_limit_w": 231}
+    P._write_restore(state)
+    smi = FakeAmdSmi(current=180)
+    with pytest.raises(PowerControlUnavailable, match="belongs to GPU 1"):
+        P.reset_from_file(gpu_index=0, amd_smi_run=smi)
+    assert P.pending_restore() == state
+    assert P.reset_from_file(amd_smi_run=smi) == state
+    assert smi.current == 231 and P.pending_restore() is None
 
 
 def test_reset_from_file_undoes_a_crashed_run(tmp_home):
@@ -330,6 +455,38 @@ def test_subprocess_sweep_uses_one_launch_and_always_restores(tmp_path):
     assert not results[2].ok and "power control unavailable" in results[2].error  # one refusal, the rest measured
     assert ctl.history[-1] == "restore" and ctl.applied is None
     assert len(seen) == 6
+
+
+def test_junction_guard_marks_failure_and_skips_remaining_power_candidates(tmp_path, monkeypatch):
+    from tests.conftest import make_hw
+
+    class GuardController(FakeController):
+        junction_temp_limit_c = 96.0
+
+    be = CountingBackend()
+    ctl = GuardController()
+    wl = Workload(n_prompts=2, prefill_tokens=8, decode_tokens=4, concurrencies=(1,))
+    runner = SubprocessTrialRunner(backends={"fake": be}, models={"fake": _fake_model()}, hw=make_hw("cpu"),
+                                   workload=wl, log_dir=tmp_path, startup_timeout=15, power=ctl, power_settle_s=0)
+    calls = 0
+
+    def guarded_trial(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return TrialMetrics(tok_s=5, output_tokens=4, requests=1)
+        return TrialMetrics(junction_temp_min_c=96.0, junction_temp_peak_c=97.0,
+                            thermal_limit_hit=True, thermal_limit_c=96.0, telemetry_source="amd_sysfs")
+
+    monkeypatch.setattr("rigtune.calibrate.search.run_trial", guarded_trial)
+    points = [PowerSetting(), PowerSetting(power_limit_w=245), PowerSetting(power_limit_w=193)]
+    results = runner.sweep(Config(backend="fake", quant="none", ctx=128, batch=1), points, "power")
+    assert calls == 2
+    assert results[1].failure_kind == "thermal_limit"
+    assert "junction temperature 97 C reached" in results[1].error
+    assert results[2].failure_kind == "thermal_limit" and not results[2].launched
+    assert "not measured because the junction temperature guard stopped" in results[2].error
+    assert ctl.applied is None and ctl.history[-1] == "restore"
 
 
 def test_runner_run_applies_and_restores_a_power_config(tmp_path):

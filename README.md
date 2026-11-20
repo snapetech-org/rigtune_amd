@@ -58,7 +58,9 @@ Every result, with methods, ablations, quality checks and limits: [docs/benchmar
 ## Quickstart
 
 ```bash
-pip install rigtune
+git clone https://github.com/snapetech-org/rigtune_amd.git
+cd rigtune_amd
+python -m pip install -e .
 pip install "vllm==0.33.0"     # ran on driver 595; 0.29.0 needs 580+; older drivers: "vllm==0.11.0" "transformers>=4.56,<5"
 rigtune serve Qwen/Qwen2.5-3B-Instruct --workload chat
 curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
@@ -73,14 +75,29 @@ Optional extras:
 - **llama.cpp** needs `llama-server` built for your runtime. CUDA uses `LLAMA_SERVER_CUDA`, HIP/ROCm uses `LLAMA_SERVER_HIP`, and Vulkan uses `LLAMA_SERVER_VULKAN`; all may fall back to `LLAMA_SERVER` or `PATH`.
 
 AMD discovery and llama.cpp device selection: [docs/amd.md](docs/amd.md).
+The AMD guide also covers ROCm vLLM/SGLang detection, AMD power-cap recovery, and the opt-in junction-temperature calibration guard.
 
-With Docker (built on the official vLLM image):
+With Docker (NVIDIA, built on the official vLLM image):
 
 ```bash
 docker build -t rigtune .
 docker run --gpus all --ipc=host -p 8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/.rigtune:/root/.rigtune rigtune serve Qwen/Qwen2.5-3B-Instruct
 ```
+
+For AMD ROCm, use a host driver compatible with the image, pass through the KFD and DRM devices, and add the
+host groups that own them (usually `video` and `render`):
+
+```bash
+docker build -f Dockerfile.rocm -t rigtune-amd:rocm .
+docker run --rm -it --device=/dev/kfd --device=/dev/dri --ipc=host \
+  --group-add "$(stat -c '%g' /dev/kfd)" --group-add "$(stat -c '%g' /dev/dri/renderD128)" \
+  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined -p 127.0.0.1:8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface -v ~/.rigtune:/root/.rigtune \
+  rigtune-amd:rocm serve Qwen/Qwen2.5-3B-Instruct --workload chat
+```
+
+The ROCm image tag follows AMD's published Radeon vLLM development image. Check [AMD's ROCm vLLM guide](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/advanced/advancedrad/linux/llm/build-docker-image.html) for current compatible tags.
 
 ### Supported hardware
 

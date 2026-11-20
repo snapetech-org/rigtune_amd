@@ -56,12 +56,23 @@ class BackendAvailability(BaseModel):
     available: bool
     version: Optional[str] = None
     reason: Optional[str] = None
+    runtime: Optional[str] = None  # "cuda" | "rocm" | "cpu", for engines whose wheel targets one runtime
+    gpu_architecture: Optional[str] = None  # selected AMD architecture, e.g. gfx1100
+    validation_level: Optional[str] = None  # detection is not evidence of a completed hardware trial
     # Versions of the libraries an engine release depends on most (torch, transformers, flashinfer, tokenizers),
     # read in the engine's own environment. No part of the hardware hash, but compared when a cached profile is
     # reused (cache.library_changes): torch, transformers and tokenizers by major.minor, FlashInfer exactly, since
     # it ships the attention kernels. vLLM 0.29.0 declared only transformers>=5.10.4, so two installs of the same
     # vLLM could differ here, and one that resolved transformers 5.23.0 failed Gemma 4's multimodal start-up.
     libs: Dict[str, str] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_runtime_metadata(self, handler) -> Dict[str, Any]:
+        data = handler(self)
+        for name in ("runtime", "gpu_architecture", "validation_level"):
+            if data.get(name) is None:
+                data.pop(name, None)
+        return data
 
 
 class HardwareDescriptor(BaseModel):
@@ -398,6 +409,10 @@ class TrialMetrics(BaseModel):
     gpu_util_pct: Optional[float] = None
     power_w: Optional[float] = None  # mean device power during the trial
     sm_clock_mhz: Optional[float] = None  # mean observed SM clock; confirms a clock lock took effect
+    junction_temp_min_c: Optional[float] = None
+    junction_temp_peak_c: Optional[float] = None
+    thermal_limit_hit: bool = False
+    thermal_limit_c: Optional[float] = None
     joules_per_token: Optional[float] = None
     # The same window's energy from NVML's total-energy counter, where the driver reports it (Volta and newer).
     # joules_per_token stays the integral of sampled power, so no recorded number moves; the two
@@ -497,6 +512,11 @@ class TrialMetrics(BaseModel):
         for name in ("answers", "spec_acceptance"):
             if data.get(name) is None:
                 data.pop(name, None)
+        for name in ("junction_temp_min_c", "junction_temp_peak_c", "thermal_limit_c"):
+            if data.get(name) is None:
+                data.pop(name, None)
+        if not data.get("thermal_limit_hit"):
+            data.pop("thermal_limit_hit", None)
         return data
 
     # A trial is not invalidated by a couple of degenerate requests. Small models sometimes emit
@@ -660,6 +680,9 @@ class Profile(BaseModel):
     options: Dict[str, str] = Field(default_factory=dict)
     backend: str
     backend_version: Optional[str]
+    engine_runtime: Optional[str] = None  # "rocm" for a ROCm-backed engine, from its own Python environment
+    gpu_architecture: Optional[str] = None  # selected AMD architecture for this completed calibration
+    validation_level: Optional[str] = None  # e.g. "hardware_trial_completed", never inferred from detection
     config: Config
     prepared: Optional[PreparedModel] = None
     # Every candidate backend's prepared model, so trials from losing backends stay analysable.
@@ -686,4 +709,7 @@ class Profile(BaseModel):
         data = handler(self)
         if data.get("calibration_id") is None:
             data.pop("calibration_id", None)
+        for name in ("engine_runtime", "gpu_architecture", "validation_level"):
+            if data.get(name) is None:
+                data.pop(name, None)
         return data

@@ -337,11 +337,15 @@ class LlamaCppBackend(BaseBackend):
                 for ub in self.UBATCHES if ub != cfg.prefill_budget]
 
     def workload_hooks(self, hw: HardwareDescriptor, model: PreparedModel) -> LlmtraceHooks:
+        gpu = hw.gpu if self.gpu_backend else None
         return LlmtraceHooks(
             health_path="/health",
             model_name=model.spec.hf_id,
             tokenizer_id=model.spec.hf_id,
-            gpu_ids=[hw.gpu.index] if (self.accelerator == "cuda" and hw.gpu) else [],
+            gpu_ids=[gpu.index] if (self.accelerator == "cuda" and gpu and gpu.vendor == "nvidia") else [],
+            gpu_vendor=gpu.vendor if gpu else None,
+            gpu_bdf=gpu.pci_bus_id if gpu else None,
+            gpu_uuid=gpu.uuid or gpu.hip_uuid if gpu else None,
             process_memory=not self.gpu_backend,
         )
 

@@ -133,6 +133,11 @@ class SearchOptions:
     arrival_rate: Optional[float] = None
     # --rate-check: with an arrival rate, re-measure the pick once with Poisson arrivals at it (search.py).
     rate_check: bool = True
+    # --max-junction-temp-c: AMD-only, opt-in workload stop guard. It is part of the cache key because
+    # guarded calibration can stop early and cannot share evidence with an unguarded run.
+    max_junction_temp_c: Optional[float] = None
+    power_min_w: Optional[int] = None  # --power-min-w: lowest PPT0 cap included in the search
+    power_max_w: Optional[int] = None  # --power-max-w: highest PPT0 cap included in the search
 
     def key(self, objective: Optional[str] = None, constraints: Optional[Constraints] = None,
             workload: Optional[Workload] = None) -> Dict[str, str]:
@@ -203,6 +208,12 @@ class SearchOptions:
             out["rate"] = f"{self.arrival_rate:g}rps"
             if not self.rate_check:  # a profile without the check's evidence is not served where it was asked for
                 out["ratecheck"] = "off"
+        if self.max_junction_temp_c is not None:
+            out["junction"] = f"{self.max_junction_temp_c:g}C"
+        if self.power_min_w is not None:
+            out["power_min"] = f"{self.power_min_w}W"
+        if self.power_max_w is not None:
+            out["power_max"] = f"{self.power_max_w}W"
         if objective == "balanced" and self.ttft_percentile != 50:
             out["ttft"] = f"p{self.ttft_percentile}"
         effective = effective_constraints(constraints, workload, self)
@@ -947,6 +958,16 @@ def _profile_for(
                      for alias, path in pm.spec_paths.items()}
     launch.args = [redact_paths(arg, private_paths) for arg in launch.args]
     workload = workload or get_workload("default")
+    availability = hw.backends.get(backend.name)
+    gpu = hw.gpu
+    engine_runtime = availability.runtime if availability is not None else None
+    if backend.name == "llamacpp-hip":
+        engine_runtime = "hip"
+    elif backend.name == "llamacpp-vulkan":
+        engine_runtime = "vulkan"
+    elif backend.name == "llamacpp-cpu":
+        engine_runtime = "cpu"
+    hardware_trial = any(result.ok and result.config.backend == backend.name for result in (table or []))
     return Profile(
         rigtune_version=__version__,
         hardware_hash=hardware_hash(hw),
@@ -958,6 +979,11 @@ def _profile_for(
         workload_spec=workload.spec(served),
         backend=backend.name,
         backend_version=backend.version(hw),
+        engine_runtime=engine_runtime,
+        gpu_architecture=gpu.architecture if gpu is not None and gpu.vendor == "amd" else None,
+        validation_level=("hardware_trial_completed" if hardware_trial else
+                          ((availability.validation_level if availability is not None else None)
+                           or ("detected_only" if gpu is not None and gpu.vendor == "amd" else None))),
         config=cfg,
         prepared=prepared,
         prepared_all=dict(prepared_all or {}),
@@ -1046,7 +1072,8 @@ def calibrate(
     if power_points is not None:  # injected (tests, or a caller that already probed the GPU)
         controller, points = power_controller, list(power_points)
     elif power_mode != "off":
-        controller, points, power_notes = setup_power(hw, power_mode, power_controller)
+        controller, points, power_notes = setup_power(hw, power_mode, power_controller,
+                                                      opts.max_junction_temp_c, opts.power_min_w, opts.power_max_w)
     from rigtune import kvtier
 
     kvtier.sweep()  # disk tiers a killed rigtune left behind, whatever this calibration asks for
@@ -1168,13 +1195,21 @@ def calibrate(
     return profile
 
 
-def setup_power(hw: HardwareDescriptor, mode: str, controller: Optional[object] = None):
+def setup_power(hw: HardwareDescriptor, mode: str, controller: Optional[object] = None,
+                junction_temp_limit_c: Optional[float] = None, power_min_w: Optional[int] = None,
+                power_max_w: Optional[int] = None):
     """Probe what this GPU permits and build the stage-4 points. Returns (controller, points, notes)."""
     from rigtune.power import PowerControlUnavailable, candidate_points, controller_for
 
     if hw.gpu is None:
         return None, [], [f"--power {mode} requested but no GPU is visible; power stage skipped"]
-    ctl = controller or controller_for(hw.gpu.index)
+    if controller is not None:
+        ctl = controller
+    elif hw.gpu.vendor == "amd":
+        ctl = controller_for(hw.gpu.index, vendor="amd", pci_bus_id=hw.gpu.pci_bus_id,
+                             hip_uuid=hw.gpu.hip_uuid, junction_temp_limit_c=junction_temp_limit_c)
+    else:
+        ctl = controller_for(hw.gpu.index)
     try:
         caps = ctl.capabilities()  # type: ignore[attr-defined]
     except PowerControlUnavailable as exc:
@@ -1184,13 +1219,96 @@ def setup_power(hw: HardwareDescriptor, mode: str, controller: Optional[object] 
         notes.append(f"power capping not permitted: {caps.reasons.get('cap', 'unknown reason')}")
     if mode in ("clock", "both") and not caps.can_lock:
         notes.append(f"clock locking not permitted: {caps.reasons.get('clock', 'unknown reason')}")
-    points = candidate_points(caps, mode)
+    try:
+        points = candidate_points(caps, mode, power_min_w=power_min_w, power_max_w=power_max_w)
+    except ValueError as exc:
+        return None, [], [str(exc)]
     trying = [p for p in points if not p.is_default]
     if not trying:
         notes.append("no power settings available to try; power stage skipped")
         return None, [], notes
     notes.append(f"power stage tried {len(trying)} settings: " + ", ".join(p.label() for p in trying))
     return ctl, points, notes
+
+
+def validate_power_bounds(hw: HardwareDescriptor, power_mode: str, power_min_w: Optional[int] = None,
+                          power_max_w: Optional[int] = None, skip_calibration: bool = False) -> None:
+    """Read-only preflight for explicit AMD cap bounds; reject bad requests before model downloads or writes."""
+    if power_min_w is None and power_max_w is None:
+        return
+    from rigtune.power import PowerControlUnavailable, candidate_points, controller_for
+
+    if power_mode not in ("cap", "both"):
+        raise ValueError("--power-min-w and --power-max-w require --power cap or --power both")
+    if skip_calibration:
+        raise ValueError("--power-min-w and --power-max-w cannot be used with --skip-calibration")
+    if power_min_w is not None and power_min_w <= 0:
+        raise ValueError("--power-min-w must be a positive number of watts")
+    if power_max_w is not None and power_max_w <= 0:
+        raise ValueError("--power-max-w must be a positive number of watts")
+    if power_min_w is not None and power_max_w is not None and power_min_w > power_max_w:
+        raise ValueError("--power-min-w must be less than or equal to --power-max-w")
+    gpu = hw.gpu
+    if gpu is None or gpu.vendor != "amd":
+        raise ValueError("--power-min-w and --power-max-w currently require a selected AMD GPU")
+    if not gpu.pci_bus_id:
+        raise ValueError("AMD power-cap bounds require a stable PCI bus address for the selected GPU")
+    try:
+        ctl = controller_for(gpu.index, vendor="amd", pci_bus_id=gpu.pci_bus_id, hip_uuid=gpu.hip_uuid)
+        caps = ctl.capabilities()
+    except PowerControlUnavailable as exc:
+        raise ValueError(f"AMD power-cap bounds need readable AMD power-cap controls: {exc}") from exc
+    if not caps.can_cap:
+        raise ValueError(f"AMD power-cap bounds need permitted AMD cap control: {caps.reasons.get('cap', 'unavailable')}")
+    try:
+        points = candidate_points(caps, "cap", power_min_w=power_min_w, power_max_w=power_max_w)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    if not any(not point.is_default for point in points):
+        raise ValueError("the requested AMD power-cap bounds contain no lower cap to calibrate")
+
+
+def validate_junction_guard(hw: HardwareDescriptor, power_mode: str, limit_c: Optional[float],
+                            layout: str = "single", phases: str = "unified",
+                            skip_calibration: bool = False, power_min_w: Optional[int] = None,
+                            power_max_w: Optional[int] = None) -> None:
+    """Refuse unsafe or ineffective guard requests before model materialization begins."""
+    if limit_c is None:
+        return
+    import math
+
+    from rigtune.amd import has_junction_sensor
+    from rigtune.power import PowerControlUnavailable, candidate_points, controller_for
+
+    if not math.isfinite(limit_c) or limit_c <= 0:
+        raise ValueError("--max-junction-temp-c must be a finite temperature above 0 C")
+    if power_mode not in ("cap", "both"):
+        raise ValueError("--max-junction-temp-c requires --power cap or --power both")
+    if skip_calibration:
+        raise ValueError("--max-junction-temp-c cannot be used with --skip-calibration")
+    if layout != "single" or phases != "unified":
+        raise ValueError("--max-junction-temp-c is supported only for a single GPU with unified serving")
+    gpu = hw.gpu
+    if gpu is None or gpu.vendor != "amd":
+        raise ValueError("--max-junction-temp-c requires a selected AMD GPU")
+    if not gpu.pci_bus_id or not has_junction_sensor(gpu.pci_bus_id):
+        raise ValueError("--max-junction-temp-c requires a readable AMD junction sensor on the selected GPU")
+    try:
+        ctl = controller_for(gpu.index, vendor="amd", pci_bus_id=gpu.pci_bus_id, hip_uuid=gpu.hip_uuid,
+                             junction_temp_limit_c=limit_c)
+        caps = ctl.capabilities()
+    except PowerControlUnavailable as exc:
+        raise ValueError(f"--max-junction-temp-c needs readable AMD power-cap controls: {exc}") from exc
+    if not caps.can_cap:
+        raise ValueError(f"--max-junction-temp-c needs permitted AMD power-cap control: "
+                         f"{caps.reasons.get('cap', 'unavailable')}")
+    if not any(not point.is_default for point in candidate_points(
+            caps, "cap", power_min_w=power_min_w, power_max_w=power_max_w)):
+        raise ValueError("--max-junction-temp-c needs at least one lower PPT0 cap to tune; this GPU's reported "
+                         "minimum is at or above its current limit")
+    if caps.junction_slowdown_c is not None and limit_c >= caps.junction_slowdown_c:
+        raise ValueError(f"--max-junction-temp-c must be below this GPU's hotspot slowdown threshold "
+                         f"({caps.junction_slowdown_c} C)")
 
 
 def distributed_arrangement(hw: HardwareDescriptor, layout: str = "single", phases: str = "unified") -> Optional[str]:
@@ -1300,6 +1418,12 @@ def resolve_profile(
     say("probe")
     hw = hw or probe()
     opts = options or SearchOptions()
+    try:
+        validate_power_bounds(hw, power_mode, opts.power_min_w, opts.power_max_w, skip_calibration)
+        validate_junction_guard(hw, power_mode, opts.max_junction_temp_c, layout, phases, skip_calibration,
+                                opts.power_min_w, opts.power_max_w)
+    except ValueError as exc:
+        raise OptionRefused(str(exc)) from exc
     if phases != "unified" and layout != "single":
         raise RuntimeError("choose either --phases (disaggregated prefill/decode) or --layout (replicas, tp), not both")
     if opts.kernel and (phases != "unified" or layout != "single"):
