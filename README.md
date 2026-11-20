@@ -1,8 +1,10 @@
-# rigtune
+# rigtune_amd
 
-[![tests](https://github.com/Aagam-Bothara/rigtune/actions/workflows/tests.yml/badge.svg)](https://github.com/Aagam-Bothara/rigtune/actions/workflows/tests.yml)
+[![tests](https://github.com/snapetech-org/rigtune_amd/actions/workflows/tests.yml/badge.svg)](https://github.com/snapetech-org/rigtune_amd/actions/workflows/tests.yml)
 
-*This used to be called PolyServe. I renamed it because a [2025 paper](https://arxiv.org/abs/2507.17769) already uses that name. Old profiles, results and settings still work ([details](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/usage.md#renamed-from-polyserve)).*
+This is the public [Snapetech fork](https://github.com/snapetech-org/rigtune_amd) of [Aagam-Bothara/rigtune](https://github.com/Aagam-Bothara/rigtune). It adds AMD GPU discovery and llama.cpp HIP/ROCm and Vulkan backends. The NVIDIA benchmark results below come from upstream rigtune; they are not AMD results from this fork. AMD support is being validated separately on Radeon hardware.
+
+*This used to be called PolyServe. I renamed it because a [2025 paper](https://arxiv.org/abs/2507.17769) already uses that name. Old profiles, results and settings still work ([details](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/usage.md#renamed-from-polyserve)).*
 
 I got tired of guessing serving flags. Every guide says something different, and what's fastest on one GPU is often slower on another. So I built a tool that just measures. rigtune tries engines, weight precisions, KV-cache types and speculative decoding on your card, with your prompts, and then serves whatever won behind an OpenAI-compatible API.
 
@@ -26,7 +28,7 @@ In November 2026 I tested it against everything I could find: stock vLLM and SGL
 
 **Why the answer check matters.** On my first run every row scored about 18% on GSM8K, stock included. Qwen3.5 thinks by default, and every answer ran out of tokens mid-thought. I nearly read that as "the speedup breaks accuracy". rigtune now turns thinking off for grading when the chat template has a switch for it. The A100 answers were graded by the comparison itself. The A40 ones were graded by scripts committed next to the results, because that run happened before the fix.
 
-Raw files are in [benchmarks/sessions/2026-11](benchmarks/sessions/2026-11/). The full method and limits are in [docs/benchmarks.md](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/benchmarks.md#2026-models-on-current-engines).
+Raw files are in [benchmarks/sessions/2026-11](benchmarks/sessions/2026-11/). The full method and limits are in [docs/benchmarks.md](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/benchmarks.md#2026-models-on-current-engines).
 
 ## Earlier results on Llama 3.1 8B
 
@@ -38,25 +40,27 @@ Before the 2026 models came out I ran Llama 3.1 8B on vLLM 0.29 and compared rig
 | A100 | **1155 tok/s** | 674 (**+71%**) | vLLM 726 |
 | A40 | **506 tok/s** | 257 (**+97%**) | vLLM 262 |
 
-† The rule: fp8 weights and KV cache, a short context, batch 256. It was **slower than changing nothing** on both Ampere cards, because an fp8 KV cache costs throughput there. A rule that's right on one card can be wrong on the next ([full sessions](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/benchmarks.md#llama-31-8b-on-four-gpus)).
+† The rule: fp8 weights and KV cache, a short context, batch 256. It was **slower than changing nothing** on both Ampere cards, because an fp8 KV cache costs throughput there. A rule that's right on one card can be wrong on the next ([full sessions](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/benchmarks.md#llama-31-8b-on-four-gpus)).
 
 A few other things I learned along the way:
 - **Your traffic matters as much as your card.** On one A40 with Qwen2.5-3B the winner changed with the prompts: suffix decoding on Dolly (+122% over stock), a draft model on news-article extraction (+66.5%), an fp8 KV cache on real chat (+10%).
 - **Calibration pays for itself fast.** It takes 22–56 minutes per model and workload, and that time comes back after 0.5–2.6 hours of busy serving.
-- **Measuring matters more than search order.** Given the same time, random sampling matched rigtune's staged search on all three 8B cards. On a 14B model in fp8 the staged search won by 4.4% ([the evidence](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/benchmarks.md#qwen25-14b-where-memory-binds)). I kept the staged search because it gives the same answer every run, tries every strategy at least once, and writes down what each setting was worth.
+- **Measuring matters more than search order.** Given the same time, random sampling matched rigtune's staged search on all three 8B cards. On a 14B model in fp8 the staged search won by 4.4% ([the evidence](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/benchmarks.md#qwen25-14b-where-memory-binds)). I kept the staged search because it gives the same answer every run, tries every strategy at least once, and writes down what each setting was worth.
 
-Every result, with methods, ablations, quality checks and limits: [docs/benchmarks.md](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/benchmarks.md).
+Every result, with methods, ablations, quality checks and limits: [docs/benchmarks.md](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/benchmarks.md).
 
 ## How is this different from auto_tune, llm-optimizer and AIConfigurator?
 
 - **vLLM's `auto_tune` and BentoML's llm-optimizer** sweep one engine's batching knobs, like the batch cap and the batched-token budget, to find the best setting under a latency target. I ran both head to head above. rigtune treats the engine itself as a variable too, alongside precision, KV-cache type and speculative decoding, and those are the dimensions that carried almost all the gain. On an RTX 4090, SGLang led the early trials and vLLM only overtook it once speculative decoding and a quantized cache were tried. Tuning the early leader alone would have thrown away the eventual winner.
-- **AIConfigurator** predicts a deployment from performance data it collected per GPU. It's very cheap because it launches nothing, but it can only answer for cards and model layers it has data for, which on these runs was none. rigtune measures instead. That costs 20–60 minutes per workload, but the answer is specific to your prompts. I also tried fitting my own predictor: it ranks the true winner at a median of 15th out of 25 measured configurations, so prediction is a filter here, never the decision ([why](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/decisions.md)).
-- **The honest gap:** nobody outside this project has run rigtune yet. If you do, please [open an issue](https://github.com/Aagam-Bothara/rigtune/issues) with what you got, good or bad.
+- **AIConfigurator** predicts a deployment from performance data it collected per GPU. It's very cheap because it launches nothing, but it can only answer for cards and model layers it has data for, which on these runs was none. rigtune measures instead. That costs 20–60 minutes per workload, but the answer is specific to your prompts. I also tried fitting my own predictor: it ranks the true winner at a median of 15th out of 25 measured configurations, so prediction is a filter here, never the decision ([why](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/decisions.md)).
+- **The honest gap:** nobody outside this project has run rigtune yet. If you do, please [open an issue](https://github.com/snapetech-org/rigtune_amd/issues) with what you got, good or bad.
 
 ## Quickstart
 
 ```bash
-pip install rigtune
+git clone https://github.com/snapetech-org/rigtune_amd.git
+cd rigtune_amd
+python -m pip install -e .
 pip install "vllm==0.33.0"     # ran on driver 595; 0.29.0 needs 580+; older drivers: "vllm==0.11.0" "transformers>=4.56,<5"
 rigtune serve Qwen/Qwen2.5-3B-Instruct --workload chat
 curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
@@ -68,9 +72,12 @@ The first launch calibrates and caches the result for this machine, model, objec
 Optional extras:
 - **Suffix decoding** needs arctic-inference built for the Python that runs vLLM: `CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')" python -m pip install --no-cache-dir --force-reinstall arctic-inference==0.1.1` ([why each part](docs/usage.md#suffix-decoding)).
 - **SGLang** can live in its own environment: set `SGLANG_PYTHON` to its `python`.
-- **llama.cpp** needs `llama-server` built with CUDA, on `PATH` or in `LLAMA_SERVER`.
+- **llama.cpp** needs `llama-server` built for your runtime. CUDA uses `LLAMA_SERVER_CUDA`, HIP/ROCm uses `LLAMA_SERVER_HIP`, and Vulkan uses `LLAMA_SERVER_VULKAN`; all may fall back to `LLAMA_SERVER` or `PATH`.
 
-With Docker (built on the official vLLM image):
+AMD discovery and llama.cpp device selection: [docs/amd.md](docs/amd.md).
+The AMD guide also covers ROCm vLLM/SGLang detection, AMD power-cap recovery, and the opt-in junction-temperature calibration guard.
+
+With Docker (NVIDIA, built on the official vLLM image):
 
 ```bash
 docker build -t rigtune .
@@ -78,24 +85,39 @@ docker run --gpus all --ipc=host -p 8000:8000 -v ~/.cache/huggingface:/root/.cac
   -v ~/.rigtune:/root/.rigtune rigtune serve Qwen/Qwen2.5-3B-Instruct
 ```
 
+For AMD ROCm, use a host driver compatible with the image, pass through the KFD and DRM devices, and add the
+host groups that own them (usually `video` and `render`):
+
+```bash
+docker build -f Dockerfile.rocm -t rigtune-amd:rocm .
+docker run --rm -it --device=/dev/kfd --device=/dev/dri --ipc=host \
+  --group-add "$(stat -c '%g' /dev/kfd)" --group-add "$(stat -c '%g' /dev/dri/renderD128)" \
+  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined -p 127.0.0.1:8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface -v ~/.rigtune:/root/.rigtune \
+  rigtune-amd:rocm serve Qwen/Qwen2.5-3B-Instruct --workload chat
+```
+
+The ROCm image tag follows AMD's published Radeon vLLM development image. Check [AMD's ROCm vLLM guide](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/advanced/advancedrad/linux/llm/build-docker-image.html) for current compatible tags.
+
 ### Supported hardware
 
 Linux, Python 3.10–3.13.
-- **NVIDIA GPUs of compute capability 7.5 or newer** run vLLM, SGLang and llama.cpp. I've measured on an A40, A100, H100 NVL, L4 and RTX 4090.
+- **NVIDIA GPUs of compute capability 7.5 or newer** run vLLM, SGLang and llama.cpp. Upstream rigtune measured on an A40, A100, H100 NVL, L4 and RTX 4090.
+- **AMD Radeon GPUs** run llama.cpp with a HIP/ROCm or Vulkan build. AMD support is currently tested on the RX 7900 XT with HIP/ROCm; other cards and Vulkan remain hardware-dependent.
 - **Older NVIDIA GPUs and x86 CPUs** run llama.cpp.
-- **Never benchmarked:** vLLM-CPU and pre-Turing GPUs ([details](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/benchmarks.md#hardware-and-engines-measured)).
+- **Never benchmarked:** vLLM-CPU and pre-Turing GPUs ([details](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/benchmarks.md#hardware-and-engines-measured)).
 
 Checked with vLLM 0.11.0, 0.29.0 and 0.33.0 and SGLang 0.5.19 and 0.5.23. `rigtune probe` lists them. Any other release gets a warning, not a refusal.
 
-Opt-in calibration and serving controls: [safeguards](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/runtime-hardening.md).
+Opt-in calibration and serving controls: [safeguards](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/runtime-hardening.md).
 
 ## Learn more
 
-- [docs/benchmarks.md](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/benchmarks.md): every result, at a glance and in full, with methods, ablations, quality, limits and what's still unmeasured.
-- [docs/usage.md](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/usage.md): how calibration works, workloads, objectives, every search option and the CLI.
-- [docs/writeup.md](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/writeup.md): the design of the memory planner, calibration and the predictor, what the evidence does and doesn't support, and the roadmap.
-- [docs/decisions.md](https://github.com/Aagam-Bothara/rigtune/blob/main/docs/decisions.md): why each choice is the way it is, including why not just random search, with the measurement that settled it.
-- [benchmarks/strategies/SUMMARY.md](https://github.com/Aagam-Bothara/rigtune/blob/main/benchmarks/strategies/SUMMARY.md): every table, regenerated from the raw JSON.
-- [CONTRIBUTING.md](https://github.com/Aagam-Bothara/rigtune/blob/main/CONTRIBUTING.md): development setup, tests and adding a backend.
+- [docs/benchmarks.md](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/benchmarks.md): every result, at a glance and in full, with methods, ablations, quality, limits and what's still unmeasured.
+- [docs/usage.md](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/usage.md): how calibration works, workloads, objectives, every search option and the CLI.
+- [docs/writeup.md](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/writeup.md): the design of the memory planner, calibration and the predictor, what the evidence does and doesn't support, and the roadmap.
+- [docs/decisions.md](https://github.com/snapetech-org/rigtune_amd/blob/main/docs/decisions.md): why each choice is the way it is, including why not just random search, with the measurement that settled it.
+- [benchmarks/strategies/SUMMARY.md](benchmarks/strategies/SUMMARY.md): every table, regenerated from the raw JSON.
+- [CONTRIBUTING.md](CONTRIBUTING.md): development setup, tests and adding a backend.
 
 MIT licensed.

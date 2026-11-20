@@ -57,7 +57,7 @@ def test_kv_bytes_follow_the_cache_type(prepared_llamacpp):
 def test_kv_flags_per_engine(prepared_vllm, prepared_llamacpp, monkeypatch):
     import rigtune.backends.llamacpp as lc
 
-    monkeypatch.setattr(lc, "llama_server_binary", lambda: "/opt/llama-server")
+    monkeypatch.setattr(lc, "llama_server_binary", lambda backend=None: "/opt/llama-server")
     v = get_backend("vllm").launch_spec(Config(backend="vllm", quant="bf16", kv_dtype="fp8"), prepared_vllm, 1).args
     assert v[v.index("--kv-cache-dtype") + 1] == "fp8"
     s = get_backend("sglang").launch_spec(Config(backend="sglang", quant="bf16", kv_dtype="fp8_e5m2"),
@@ -253,7 +253,7 @@ def test_warmup_leaves_the_real_prefix_cached(monkeypatch):
 def test_prefix_cache_controls(prepared_vllm, prepared_llamacpp, monkeypatch):
     import rigtune.backends.llamacpp as lc
 
-    monkeypatch.setattr(lc, "llama_server_binary", lambda: "/opt/llama-server")
+    monkeypatch.setattr(lc, "llama_server_binary", lambda backend=None: "/opt/llama-server")
     v = get_backend("vllm")
     assert "--enable-prefix-caching" in v.launch_spec(Config(backend="vllm", quant="bf16", prefix_cache=True),
                                                       prepared_vllm, 1).args
@@ -369,7 +369,7 @@ def test_vllm_offers_draft_models_only_where_supported(prepared_vllm, monkeypatc
 def test_llamacpp_speculation_needs_a_downloaded_draft(prepared_llamacpp, monkeypatch):
     import rigtune.backends.llamacpp as lc
 
-    monkeypatch.setattr(lc, "llama_server_binary", lambda: "/opt/llama-server")
+    monkeypatch.setattr(lc, "llama_server_binary", lambda backend=None: "/opt/llama-server")
     be = get_backend("llamacpp-cuda")
     base = Config(backend="llamacpp-cuda", quant="Q4_K_M", batch=4, n_gpu_layers=29)
     assert be.spec_variants(base, prepared_llamacpp) == []  # no draft resolved
@@ -388,7 +388,7 @@ def test_llamacpp_speculation_needs_a_downloaded_draft(prepared_llamacpp, monkey
 def test_llamacpp_follows_the_renamed_speculative_flags(prepared_llamacpp, monkeypatch):
     import rigtune.backends.llamacpp as lc
 
-    monkeypatch.setattr(lc, "llama_server_binary", lambda: "/opt/llama-server")
+    monkeypatch.setattr(lc, "llama_server_binary", lambda backend=None: "/opt/llama-server")
     monkeypatch.setattr(lc, "server_help", lambda binary: "--spec-type ngram-mod\n--spec-draft-n-max N")
     be = get_backend("llamacpp-cuda")
     draft = "meta-llama/Llama-3.2-1B-Instruct"
@@ -470,7 +470,7 @@ def test_load_balancer_spreads_requests_and_streams():
 def test_replica_and_tensor_parallel_launches(hw_a100, prepared_vllm, prepared_llamacpp, monkeypatch):
     import rigtune.backends.llamacpp as lc
 
-    monkeypatch.setattr(lc, "llama_server_binary", lambda: "/opt/llama-server")
+    monkeypatch.setattr(lc, "llama_server_binary", lambda backend=None: "/opt/llama-server")
     cfg = Config(backend="vllm", quant="fp8", ctx=4096, batch=64, gpu_memory_utilization=0.9)
     rep = get_backend("vllm").replica_launch_spec(cfg, prepared_vllm, 9000, 1)
     assert rep.env["CUDA_VISIBLE_DEVICES"] == "1"

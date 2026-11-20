@@ -1,4 +1,4 @@
-"""llama.cpp backend: `llama-server`, CUDA (any NVIDIA GPU, incl. Pascal/Volta) and CPU."""
+"""llama.cpp backend: CUDA, AMD HIP/ROCm, Vulkan, and CPU variants."""
 
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ from rigtune.gguf import (
     estimate_gguf_bytes,
     search_hub_gguf,
 )
-from rigtune.hardware import llama_server_binary
-from rigtune.hfconfig import load_arch
-from rigtune.memory import MemoryModel
-from rigtune.models import Config, HardwareDescriptor, MiB, ModelSpec, PreparedModel
+from rigtune.hardware import llama_server_binary, llama_server_device_index
+from rigtune.hfconfig import arch_from_config, load_arch, load_gguf_config
+from rigtune.memory import HybridKV, MemoryModel
+from rigtune.models import ArchInfo, Config, HardwareDescriptor, MiB, ModelSpec, PreparedModel
 
 
 @functools.lru_cache(maxsize=8)
@@ -42,28 +42,52 @@ logger = logging.getLogger(__name__)
 
 
 class LlamaCppBackend(BaseBackend):
-    """Shared implementation; the CUDA and CPU variants differ in offload and workspace."""
+    """Shared implementation; CUDA, HIP, Vulkan, and CPU variants differ in offload and device selection."""
 
     name = "llamacpp"
-    cuda = False
-    runtime_workspace_bytes = 768 * MiB  # compute buffers (scale with n_batch) + CUDA context
+    accelerator: Optional[str] = None
+    gpu_vendor: Optional[str] = None
+    gpu_backend = False
+    runtime_workspace_bytes = 768 * MiB  # compute buffers (scale with n_batch) + accelerator context
 
     def supports(self, hw: HardwareDescriptor, model: ModelSpec) -> bool:
-        if self.cuda and (hw.gpu is None or hw.gpu.vendor != "nvidia"):
+        binary = llama_server_binary(self.accelerator)
+        if not binary:
             return False
-        return llama_server_binary() is not None
+        if not self.gpu_backend:
+            return True
+        return any(gpu.vendor == self.gpu_vendor for gpu in hw.gpus) if self.gpu_vendor else bool(hw.gpus)
+
+    def _device_extra(self, hw: HardwareDescriptor) -> Dict[str, object]:
+        if self.accelerator not in ("hip", "vulkan") or hw.gpu is None:
+            return {}
+        extra: Dict[str, object] = {
+            "rigtune_gpu_index": hw.gpu.index,
+            "rigtune_gpu_name": hw.gpu.name,
+        }
+        if hw.gpu.uuid:
+            extra["rigtune_gpu_uuid"] = hw.gpu.uuid
+        if hw.gpu.hip_uuid:
+            extra["rigtune_gpu_hip_uuid"] = hw.gpu.hip_uuid
+        if hw.gpu.pci_bus_id:
+            extra["rigtune_gpu_pci_bus_id"] = hw.gpu.pci_bus_id
+        return extra
 
     # ---- prepare: resolve (no download); materialize: download/convert only what the planner kept
 
     def prepare(self, model: ModelSpec, hw: HardwareDescriptor, quants: Optional[List[str]] = None) -> PreparedModel:
-        arch = load_arch(model)
+        local_gguf = os.path.isfile(model.hf_id) and model.hf_id.lower().endswith(".gguf")
+        gguf_config = load_gguf_config(model.hf_id) if local_gguf else None
+        arch = arch_from_config(gguf_config) if gguf_config is not None else load_arch(model)
         quants = list(quants or GGUF_QUANTS)
         prepared = PreparedModel(spec=model, backend=self.name, arch=arch)
-        if os.path.isfile(model.hf_id) and model.hf_id.lower().endswith(".gguf"):
+        if local_gguf:
             # Local GGUF file given directly.
             q = _quant_from_filename(model.hf_id) or "Q4_K_M"
             prepared.gguf_paths[q] = model.hf_id
             prepared.weights_bytes[q] = os.path.getsize(model.hf_id)
+            if gguf_config and gguf_config.get("_gguf_mtp_tensor_count") and arch.mtp_layers:
+                prepared.spec_repos["mtp"] = model.hf_id
             return prepared
         try:
             found: Dict[str, GGUFCandidate] = search_hub_gguf(model, quants)
@@ -123,10 +147,12 @@ class LlamaCppBackend(BaseBackend):
                     model.draft_paths.pop(draft, None)
         return model
 
-    # ---- memory: llama-server allocates the full KV for -c up front (per-slot ctx x n_parallel)
+    # ---- memory: attention KV spans per-slot ctx x n_parallel; recurrent state is per parallel sequence
 
     def memory_model(self, hw: HardwareDescriptor) -> MemoryModel:
-        return self.calibrated_memory(hw, lambda cfg: cfg.ctx * cfg.batch, "gpu" if self.cuda else "cpu")
+        hybrid_fn = llamacpp_hybrid_kv if self.gpu_backend else None
+        return self.calibrated_memory(hw, lambda cfg: cfg.ctx * cfg.batch, "gpu" if self.gpu_backend else "cpu",
+                                      hybrid_fn=hybrid_fn)
 
     # ---- configs
 
@@ -149,9 +175,12 @@ class LlamaCppBackend(BaseBackend):
     def spec_variants(self, cfg: Config, model: PreparedModel, hw: Optional[HardwareDescriptor] = None,
                       all_methods: bool = False, min_batch: Optional[int] = None) -> List[Config]:
         specs: List[str] = []
-        binary = llama_server_binary()
+        binary = llama_server_binary(self.accelerator)
         if binary and _modern_spec(binary):  # built-in n-gram lookup: no second model needed
             specs.append(speculative.ngram(speculative.NGRAM_TOKENS_LLAMACPP))
+        if (all_methods and binary and "draft-mtp" in server_help(binary)
+                and speculative.MTP_KEY in model.spec_repos):
+            specs.extend(speculative.mtp(k) for k in (*speculative.MTP_TOKENS, 2))
         draft = speculative.draft_for(model.spec.hf_id)
         path = model.draft_paths.get(draft or "")
         if draft and path and not path.startswith(("hf://", "convert://")):
@@ -164,7 +193,7 @@ class LlamaCppBackend(BaseBackend):
     def candidate_configs(self, hw: HardwareDescriptor, model: PreparedModel, min_ctx: int = 0) -> List[Config]:
         layers = model.arch.num_layers
         ctxs = ctx_grid(model.arch.max_position_embeddings, min_ctx)
-        if self.cuda:
+        if self.gpu_backend:
             ngls = sorted({layers + 1, (3 * layers) // 4, layers // 2}, reverse=True)  # +1 = output layer too
             n_batches = [512]
         else:
@@ -178,7 +207,8 @@ class LlamaCppBackend(BaseBackend):
                         for nb in n_batches:
                             out.append(
                                 Config(
-                                    backend=self.name, quant=quant, ctx=ctx, batch=np_, n_gpu_layers=ngl, n_batch=nb
+                                    backend=self.name, quant=quant, ctx=ctx, batch=np_, n_gpu_layers=ngl,
+                                    n_batch=nb, extra=self._device_extra(hw),
                                 )
                             )
         return out
@@ -190,8 +220,9 @@ class LlamaCppBackend(BaseBackend):
             quant="Q4_K_M" if "Q4_K_M" in quants else quants[0],
             ctx=min(max(4096, min_ctx), model.arch.max_position_embeddings),
             batch=4,
-            n_gpu_layers=(model.arch.num_layers + 1) if self.cuda else 0,
+            n_gpu_layers=(model.arch.num_layers + 1) if self.gpu_backend else 0,
             n_batch=512,
+            extra=self._device_extra(hw),
         )
 
     # ---- launch
@@ -201,6 +232,10 @@ class LlamaCppBackend(BaseBackend):
         older builds only know the draft-model flags."""
         kind, draft, k = speculative.parse(spec)
         modern = _modern_spec(binary)
+        if kind == "mtp":
+            if "draft-mtp" not in server_help(binary):
+                raise RuntimeError("this llama-server has no built-in MTP speculative decoding")
+            return ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(k)]
         if kind == "ngram":
             if not modern:
                 raise RuntimeError("this llama-server has no built-in n-gram speculative decoding")
@@ -212,12 +247,12 @@ class LlamaCppBackend(BaseBackend):
             raise RuntimeError(f"draft model for {spec} not materialized")
         out = ["-md", draft_path]
         out += ["--spec-type", "draft-simple", "--spec-draft-n-max", str(k)] if modern else ["--draft-max", str(k)]
-        if self.cuda:
+        if self.gpu_backend:
             out += ["-ngld", "999"]
         return out
 
     def launch_spec(self, cfg: Config, model: PreparedModel, port: int) -> LaunchSpec:
-        binary = llama_server_binary()
+        binary = llama_server_binary(self.accelerator)
         if binary is None:
             raise RuntimeError("llama-server not found on PATH (set $LLAMA_SERVER)")
         path = model.gguf_paths.get(cfg.quant)
@@ -232,25 +267,67 @@ class LlamaCppBackend(BaseBackend):
             "-c", str(cfg.ctx * n_parallel),  # -c is total context, split across slots
             "-np", str(n_parallel),
             "-b", str(max(cfg.n_batch or 512, cfg.prefill_budget or 0)),  # logical batch must cover -ub
-            "-ngl", str(cfg.n_gpu_layers if cfg.n_gpu_layers is not None else (999 if self.cuda else 0)),
+            "-ngl", str(cfg.n_gpu_layers if cfg.n_gpu_layers is not None else (999 if self.gpu_backend else 0)),
             "--alias", model.spec.hf_id,
         ]
+        template = Path(path).parent / "chat_template.jinja"
+        if template.is_file():
+            args += ["--chat-template-file", str(template), "--jinja"]
+        reasoning = os.environ.get("RIGTUNE_LLAMA_REASONING")
+        if reasoning in ("on", "off", "auto"):
+            args += ["--reasoning", reasoning]
         if cfg.prefill_budget is not None:
             args += ["-ub", str(cfg.prefill_budget)]
         threads = cfg.extra.get("threads")
         if threads:
             args += ["-t", str(threads)]
-        if self.cuda or cfg.kv_dtype != "auto":
+        if self.gpu_backend or cfg.kv_dtype != "auto":
             args += ["-fa", "on"]  # a quantized V cache needs flash attention, on CPU too
         if cfg.kv_dtype != "auto":
             args += ["-ctk", cfg.kv_dtype, "-ctv", cfg.kv_dtype]
         if cfg.spec_decode:
             args += self._spec_args(cfg.spec_decode, model, binary)
-        args += render_extra(cfg.extra, skip=("threads",))
+        args += render_extra(cfg.extra, skip=("threads", "rigtune_gpu_index", "rigtune_gpu_name", "rigtune_gpu_uuid",
+                                              "rigtune_gpu_hip_uuid", "rigtune_gpu_pci_bus_id"))
         env = {}
-        if not self.cuda:
-            env["CUDA_VISIBLE_DEVICES"] = ""
+        if self.accelerator == "hip":
+            selected = (cfg.extra.get("rigtune_gpu_hip_uuid") or cfg.extra.get("rigtune_gpu_uuid")
+                        or cfg.extra.get("rigtune_gpu_index"))
+            if selected is not None:
+                env["ROCR_VISIBLE_DEVICES"] = str(selected)
+                env["HIP_VISIBLE_DEVICES"] = "0"
+        elif self.accelerator == "vulkan":
+            gpu_name = str(cfg.extra.get("rigtune_gpu_name") or "")
+            gpu_identity = str(cfg.extra.get("rigtune_gpu_pci_bus_id") or cfg.extra.get("rigtune_gpu_uuid") or "")
+            index = llama_server_device_index("vulkan", gpu_name, binary,
+                                              gpu_identity=gpu_identity or None)
+            if index is None:
+                raise RuntimeError(f"llama-server Vulkan build does not uniquely identify selected GPU {gpu_name!r}; "
+                                   "check `llama-server --list-devices` for a matching, unambiguous device")
+            if "--device" in server_help(binary):
+                args += ["--device", f"Vulkan{index}"]
+            else:
+                mask = os.environ.get("GGML_VK_VISIBLE_DEVICES")
+                if mask is not None:
+                    raise RuntimeError("this llama-server build has no --device selector; clear "
+                                       "GGML_VK_VISIBLE_DEVICES or use a newer build to pin the selected GPU")
+                env["GGML_VK_VISIBLE_DEVICES"] = str(index)
+        elif not self.gpu_backend:
+            env.update({
+                "CUDA_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "",
+                "GGML_VK_VISIBLE_DEVICES": "",
+            })
         return LaunchSpec(args=args, env=env)
+
+    def replica_launch_spec(self, cfg: Config, model: PreparedModel, port: int, gpu_index: int) -> LaunchSpec:
+        spec = self.launch_spec(cfg, model, port)
+        if self.accelerator == "hip":
+            spec.env = {**spec.env, "ROCR_VISIBLE_DEVICES": str(gpu_index), "HIP_VISIBLE_DEVICES": "0"}
+        elif self.accelerator == "vulkan":
+            spec.env = {**spec.env, "GGML_VK_VISIBLE_DEVICES": str(gpu_index)}
+        elif self.accelerator == "cuda":
+            spec.env = {**spec.env, "CUDA_VISIBLE_DEVICES": str(gpu_index)}
+        return spec
 
     # Physical prompt-processing batch (-ub) to try around the engine default of 512.
     UBATCHES = (256, 1024, 2048)
@@ -260,23 +337,60 @@ class LlamaCppBackend(BaseBackend):
                 for ub in self.UBATCHES if ub != cfg.prefill_budget]
 
     def workload_hooks(self, hw: HardwareDescriptor, model: PreparedModel) -> LlmtraceHooks:
+        gpu = hw.gpu if self.gpu_backend else None
         return LlmtraceHooks(
             health_path="/health",
             model_name=model.spec.hf_id,
             tokenizer_id=model.spec.hf_id,
-            gpu_ids=[hw.gpu.index] if (self.cuda and hw.gpu) else [],
-            process_memory=not self.cuda,
+            gpu_ids=[gpu.index] if (self.accelerator == "cuda" and gpu and gpu.vendor == "nvidia") else [],
+            gpu_vendor=gpu.vendor if gpu else None,
+            gpu_bdf=gpu.pci_bus_id if gpu else None,
+            gpu_uuid=gpu.uuid or gpu.hip_uuid if gpu else None,
+            process_memory=not self.gpu_backend,
         )
 
 
 class LlamaCppCudaBackend(LlamaCppBackend):
     name = "llamacpp-cuda"
-    cuda = True
+    accelerator = "cuda"
+    gpu_vendor = "nvidia"
+    gpu_backend = True
+
+
+class LlamaCppHipBackend(LlamaCppBackend):
+    name = "llamacpp-hip"
+    accelerator = "hip"
+    gpu_vendor = "amd"
+    gpu_backend = True
+
+
+class LlamaCppVulkanBackend(LlamaCppBackend):
+    name = "llamacpp-vulkan"
+    accelerator = "vulkan"
+    gpu_backend = True
+
+
+def llamacpp_hybrid_kv(cfg: Config, arch: ArchInfo) -> HybridKV:
+    """llama.cpp hybrid cache: attention KV per token and F32 recurrent state per parallel sequence.
+
+    The rules follow llama-memory-hybrid.cpp and llama-memory-recurrent.cpp. The built-in MTP context
+    adds its dense attention layer when enabled; its recurrent snapshot count is zero.
+    """
+    kind = speculative.parse(cfg.spec_decode)[0] if cfg.spec_decode else None
+    full_layers = (arch.full_attention_layers or 0) + (
+        arch.mtp_layers if kind in speculative.SELF_HEAD else 0
+    )
+    return HybridKV(
+        state_slots=max(1, cfg.batch),
+        state_bytes=arch.linear_state_bytes_llamacpp,
+        full_layers=full_layers or None,
+    )
 
 
 class LlamaCppCpuBackend(LlamaCppBackend):
     name = "llamacpp-cpu"
-    cuda = False
+    accelerator = None
+    gpu_backend = False
     runtime_workspace_bytes = 512 * MiB
 
     def candidate_configs(self, hw: HardwareDescriptor, model: PreparedModel, min_ctx: int = 0) -> List[Config]:

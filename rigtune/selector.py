@@ -52,6 +52,13 @@ def select_backends(
                 candidates.append("sglang")
         if ok("llamacpp-cuda"):
             candidates.append("llamacpp-cuda")
+        if ok("llamacpp-vulkan"):
+            candidates.append("llamacpp-vulkan")
+    elif gpu is not None and gpu.vendor == "amd":
+        if ok("llamacpp-hip"):
+            candidates.append("llamacpp-hip")
+        if ok("llamacpp-vulkan"):
+            candidates.append("llamacpp-vulkan")
     if gpu is None:
         if ok("llamacpp-cpu"):
             candidates.append("llamacpp-cpu")
@@ -71,6 +78,7 @@ def explain(hw: HardwareDescriptor) -> List[str]:
     for name, b in sorted(hw.backends.items()):
         state = "available" if b.available else f"unavailable ({b.reason or 'unknown'})"
         ver = f" v{b.version}" if b.version else ""
+        runtime = f" [{b.runtime}]" if b.runtime else ""
         libs = f" ({', '.join(f'{k} {v}' for k, v in sorted(b.libs.items()))})" if b.libs else ""
-        lines.append(f"{name}{ver}: {state}{libs}")
+        lines.append(f"{name}{ver}{runtime}: {state}{libs}")
     return lines

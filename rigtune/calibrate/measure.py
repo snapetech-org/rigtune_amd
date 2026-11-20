@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 
 from rigtune.backends.base import LlmtraceHooks
+from rigtune.amd import read_sysfs_metrics
 from rigtune.calibrate.datasets import CHARS_PER_TOKEN, Session, Step
 from rigtune.calibrate.tokens import TokenCounter, worst_source
 from rigtune.calibrate.workload import TURN_OVERHEAD, Workload
@@ -50,6 +51,9 @@ class TelemetrySummary:
     # or None. Sampled power on an A100 is a ~1 s board average read every 100 ms: its
     # integral is right over a long window and smears anything shorter, which the counter does not.
     counter_energy_j: Optional[float] = None
+    junction_temp_min_c: Optional[float] = None
+    junction_temp_peak_c: Optional[float] = None
+    thermal_limit_hit: bool = False
 
 
 @dataclass
@@ -59,6 +63,7 @@ class _Sample:
     util: Optional[float] = None
     power_w: Optional[float] = None
     clock_mhz: Optional[float] = None
+    junction_temp_c: Optional[float] = None
 
 
 def _summarize(samples: List[_Sample], source: str, extra_energy: Optional[float] = None) -> TelemetrySummary:
@@ -67,8 +72,12 @@ def _summarize(samples: List[_Sample], source: str, extra_energy: Optional[float
     utils = [x.util for x in samples if x.util is not None]
     powers = [(x.t, x.power_w) for x in samples if x.power_w is not None]
     clocks = [x.clock_mhz for x in samples if x.clock_mhz is not None]
+    junctions = [x.junction_temp_c for x in samples if x.junction_temp_c is not None]
     if clocks:
         s.sm_clock_mhz = statistics.fmean(clocks)
+    if junctions:
+        s.junction_temp_min_c = min(junctions)
+        s.junction_temp_peak_c = max(junctions)
     if mems:
         s.peak_mem_mb = max(mems)
     if utils:
@@ -151,11 +160,15 @@ class Telemetry:
     """Context manager sampling GPU (llmtrace/pynvml) or process (psutil) telemetry."""
 
     def __init__(self, hooks: LlmtraceHooks, pid: Optional[int] = None, interval_ms: int = 100,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, junction_temp_limit_c: Optional[float] = None,
+                 on_thermal_limit: Optional[Callable[[float], None]] = None):
         self.hooks = hooks
         self._clock = clock  # stamps the samples rigtune takes itself, and the marks; injectable for tests
         self.pid = pid
         self.interval_ms = interval_ms
+        self.junction_temp_limit_c = junction_temp_limit_c
+        self.on_thermal_limit = on_thermal_limit
+        self._thermal_limit_hit = False
         self._samples: List[_Sample] = []
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -180,6 +193,8 @@ class Telemetry:
         self.stop()
 
     def start(self) -> None:
+        if self.hooks.gpu_vendor == "amd" and self.hooks.gpu_bdf and self._start_amd_sysfs():
+            return
         if self.hooks.gpu_ids:
             self._open_counter()
         if self.hooks.gpu_ids and self._start_llmtrace():
@@ -211,12 +226,14 @@ class Telemetry:
         if self._mark is None:
             self.summary = _summarize(samples, self._source, _rapl_delta(self._rapl_start, rapl_end))
             self.summary.counter_energy_j = _counter_delta_j(self._counter_start, counter_end)
+            self.summary.thermal_limit_hit = self._thermal_limit_hit
             return
         mono, wall, counter_mid, rapl_mid = self._mark
         split, t_end = (wall, end_wall) if wall_clock else (mono, end_mono)
         active = [x for x in samples if x.t <= split]
         self.summary = _summarize(active, self._source, _rapl_delta(self._rapl_start, rapl_mid))
         self.summary.counter_energy_j = _counter_delta_j(self._counter_start, counter_mid)
+        self.summary.thermal_limit_hit = self._thermal_limit_hit
         before = [x.power_w for x in active if x.power_w is not None]
         tail = [(x.t, x.power_w) for x in samples if x.t > split and x.power_w is not None]
         counter_idle_w = None
@@ -273,6 +290,25 @@ class Telemetry:
         return self._samples, False
 
     # ---- backends
+
+    def _start_amd_sysfs(self) -> bool:
+        bdf = self.hooks.gpu_bdf
+        if not bdf:
+            return False
+        initial = read_sysfs_metrics(bdf)
+        if all(value is None for value in (initial.memory_used_mb, initial.utilization_pct, initial.power_w,
+                                            initial.clock_mhz, initial.junction_temp_c)):
+            return False
+
+        def read() -> _Sample:
+            value = read_sysfs_metrics(bdf)
+            return _Sample(t=self._clock(), mem_mb=value.memory_used_mb, util=value.utilization_pct,
+                           power_w=value.power_w, clock_mhz=value.clock_mhz,
+                           junction_temp_c=value.junction_temp_c)
+
+        self._source = "amd_sysfs"
+        self._run_thread(read)
+        return True
 
     def _start_llmtrace(self) -> bool:
         if importlib.util.find_spec("llmtrace") is None:
@@ -355,7 +391,13 @@ class Telemetry:
         def loop() -> None:
             while not self._stop.is_set():
                 try:
-                    self._samples.append(read())
+                    sample = read()
+                    self._samples.append(sample)
+                    if (self.junction_temp_limit_c is not None and sample.junction_temp_c is not None
+                            and sample.junction_temp_c >= self.junction_temp_limit_c and not self._thermal_limit_hit):
+                        self._thermal_limit_hit = True
+                        if self.on_thermal_limit is not None:
+                            self.on_thermal_limit(sample.junction_temp_c)
                 except Exception as exc:  # pragma: no cover
                     logger.debug("telemetry read failed: %s", exc)
                 self._stop.wait(interval)
@@ -367,6 +409,17 @@ class Telemetry:
 
         self._thread = threading.Thread(target=loop, name="rigtune-telemetry", daemon=True)
         self._thread.start()
+
+
+def _telemetry_for_trial(hooks: LlmtraceHooks, pid: Optional[int], junction_temp_limit_c: Optional[float],
+                         on_thermal_limit: Optional[Callable[[float], None]]) -> Telemetry:
+    # Keep the historical constructor shape for test doubles and integrations when no guard was requested.
+    kwargs: Dict[str, Any] = {}
+    if junction_temp_limit_c is not None:
+        kwargs["junction_temp_limit_c"] = junction_temp_limit_c
+    if on_thermal_limit is not None:
+        kwargs["on_thermal_limit"] = on_thermal_limit
+    return Telemetry(hooks, pid=pid, **kwargs)
 
 
 def _counter_mj(nvml: Any, handles: List[Any]) -> Optional[float]:
@@ -1419,6 +1472,8 @@ def run_trial(
     seed: int = 0,
     answers: bool = False,
     on_level: Optional[Callable[[int, List[RequestOutcome]], None]] = None,
+    junction_temp_limit_c: Optional[float] = None,
+    on_thermal_limit: Optional[Callable[[float], None]] = None,
 ) -> TrialMetrics:
     """Run the workload at each concurrency level and fold into one TrialMetrics.
 
@@ -1473,12 +1528,24 @@ def run_trial(
         if workload.sessions:
             small = _session_warmup(workload, small)
         try:
-            asyncio.run(_drive(base_url, hooks, small, top, request_timeout, counter))
+            if junction_temp_limit_c is None:
+                asyncio.run(_drive(base_url, hooks, small, top, request_timeout, counter))
+            else:
+                # Warm-up also loads the GPU. Keep the guard active there, then return a failed
+                # measurement before dispatching the scored workload if it trips.
+                with _telemetry_for_trial(hooks, pid, junction_temp_limit_c, on_thermal_limit) as guard:
+                    asyncio.run(_drive(base_url, hooks, small, top, request_timeout, counter))
+                if guard.summary.thermal_limit_hit:
+                    return TrialMetrics(junction_temp_min_c=guard.summary.junction_temp_min_c,
+                                        junction_temp_peak_c=guard.summary.junction_temp_peak_c,
+                                        thermal_limit_hit=True, thermal_limit_c=junction_temp_limit_c,
+                                        telemetry_source=guard.summary.source)
         except Exception as exc:
             logger.debug("warmup failed: %s", exc)
 
     if arrival_rate is not None:
-        return _open_loop(base_url, hooks, workload, arrival_rate, seed, pid, request_timeout, counter, prompt_tokens)
+        return _open_loop(base_url, hooks, workload, arrival_rate, seed, pid, request_timeout, counter, prompt_tokens,
+                          junction_temp_limit_c, on_thermal_limit)
 
     per_level: Dict[str, TrialMetrics] = {}
     total_energy = 0.0
@@ -1509,7 +1576,7 @@ def run_trial(
 
         resampled = False
         counters = _prefix_counters(base_url, hooks) if workload.sessions else None  # outside the measured window
-        with Telemetry(hooks, pid=pid) as tel:
+        with _telemetry_for_trial(hooks, pid, junction_temp_limit_c, on_thermal_limit) as tel:
             outcomes, wall = drive(level)
             own = outcomes  # the level's own prompts, the same for every configuration
             if close_call is not None and close_call(_metrics_from(outcomes, wall, c, hooks.tier_report)):
@@ -1551,6 +1618,12 @@ def run_trial(
         m.power_w = s.power_w
         m.sm_clock_mhz = s.sm_clock_mhz
         m.counter_energy_j = s.counter_energy_j
+        m.junction_temp_min_c = s.junction_temp_min_c
+        m.junction_temp_peak_c = s.junction_temp_peak_c
+        m.energy_source = ("nvml_counter" if s.counter_energy_j is not None else
+                           ("trapezoid" if s.energy_j is not None else None))
+        m.thermal_limit_hit = s.thermal_limit_hit
+        m.thermal_limit_c = junction_temp_limit_c
         if s.sm_clock_mhz is not None:
             clocks.append(s.sm_clock_mhz)
         if s.energy_j is not None and m.output_tokens:
@@ -1565,6 +1638,8 @@ def run_trial(
         if s.power_w is not None:
             powers.append(s.power_w)
         per_level[str(c)] = m
+        if s.thermal_limit_hit:
+            break
         if enough is not None and m.ok and enough(m):
             break
 
@@ -1582,6 +1657,12 @@ def run_trial(
         sm_clock_mhz=statistics.fmean(clocks) if clocks else None,
         joules_per_token=(total_energy / total_tokens) if (energy_known and total_tokens) else None,
         counter_energy_j=sum(counted) if all(e is not None for e in counted) else None,  # type: ignore[misc]
+        junction_temp_min_c=min((m.junction_temp_min_c for m in per_level.values()
+                                 if m.junction_temp_min_c is not None), default=None),
+        junction_temp_peak_c=max((m.junction_temp_peak_c for m in per_level.values()
+                                  if m.junction_temp_peak_c is not None), default=None),
+        thermal_limit_hit=any(m.thermal_limit_hit for m in per_level.values()),
+        thermal_limit_c=junction_temp_limit_c,
         duration_s=sum(x.duration_s for x in per_level.values()),
         requests=sum(x.requests for x in per_level.values()),
         failed=sum(x.failed for x in per_level.values()),
@@ -1610,11 +1691,13 @@ def run_trial(
 
 
 def _open_loop(base_url: str, hooks: LlmtraceHooks, workload: Workload, rate: float, seed: int, pid: Optional[int],
-               timeout: float, counter: TokenCounter, prompt_tokens: int) -> TrialMetrics:
+               timeout: float, counter: TokenCounter, prompt_tokens: int,
+               junction_temp_limit_c: Optional[float] = None,
+               on_thermal_limit: Optional[Callable[[float], None]] = None) -> TrialMetrics:
     """One open-loop run at `rate` requests per second (see run_trial)."""
     times, window = arrival_schedule(rate, OPEN_LOOP_REQUESTS, seed, OPEN_LOOP_MAX_S, OPEN_LOOP_MIN_S)
     lw = replace(workload, prompts=_open_loop_prompts(workload, len(times), counter), n_prompts=len(times))
-    with Telemetry(hooks, pid=pid) as tel:
+    with _telemetry_for_trial(hooks, pid, junction_temp_limit_c, on_thermal_limit) as tel:
         outcomes, wall, peak = asyncio.run(_drive_open(base_url, hooks, lw, times, window, timeout, counter))
     m = _metrics_from(outcomes, wall, max(1, peak))
     s = tel.summary
@@ -1624,6 +1707,10 @@ def _open_loop(base_url: str, hooks: LlmtraceHooks, workload: Workload, rate: fl
     m.telemetry_source, m.prompt_tokens = s.source, prompt_tokens
     m.peak_mem_mb, m.gpu_util_pct, m.power_w, m.sm_clock_mhz = s.peak_mem_mb, s.gpu_util_pct, s.power_w, s.sm_clock_mhz
     m.counter_energy_j = s.counter_energy_j
+    m.junction_temp_min_c = s.junction_temp_min_c
+    m.junction_temp_peak_c = s.junction_temp_peak_c
+    m.thermal_limit_hit = s.thermal_limit_hit
+    m.thermal_limit_c = junction_temp_limit_c
     if energy is not None and served > 0:
         m.joules_per_request = energy / served
         m.joules_per_token = energy / m.output_tokens if m.output_tokens else None

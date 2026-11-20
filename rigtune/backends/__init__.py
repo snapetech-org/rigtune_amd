@@ -9,12 +9,17 @@ from rigtune.backends.base import Backend, BaseBackend, LaunchSpec, LlmtraceHook
 
 def registry(report_reuse: bool = False) -> Dict[str, BaseBackend]:
     """Every backend. `report_reuse` (session files) launches engines that report per-request cached tokens."""
-    from rigtune.backends.llamacpp import LlamaCppCpuBackend, LlamaCppCudaBackend
+    from rigtune.backends.llamacpp import (
+        LlamaCppCpuBackend, LlamaCppCudaBackend, LlamaCppHipBackend, LlamaCppVulkanBackend,
+    )
     from rigtune.backends.sglang import SglangBackend
     from rigtune.backends.vllm import VllmBackend
     from rigtune.backends.vllm_cpu import VllmCpuBackend
 
-    backends = [VllmBackend(), SglangBackend(), LlamaCppCudaBackend(), LlamaCppCpuBackend(), VllmCpuBackend()]
+    backends = [
+        VllmBackend(), SglangBackend(), LlamaCppCudaBackend(), LlamaCppHipBackend(), LlamaCppVulkanBackend(),
+        LlamaCppCpuBackend(), VllmCpuBackend(),
+    ]
     for b in backends:
         b.report_reuse = report_reuse
     return {b.name: b for b in backends}

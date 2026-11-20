@@ -347,7 +347,7 @@ def _no_network():
     stack.enter_context(mock.patch.object(vl, "vllm_registry_archs", lambda: None))
     stack.enter_context(mock.patch.object(sg, "sglang_registry_archs", lambda: None))
     stack.enter_context(mock.patch.object(lc, "search_hub_gguf", lambda spec, quants, **kw: {}))
-    stack.enter_context(mock.patch.object(lc, "llama_server_binary", lambda: "/usr/local/bin/llama-server"))
+    stack.enter_context(mock.patch.object(lc, "llama_server_binary", lambda backend=None: "/usr/local/bin/llama-server"))
     stack.enter_context(mock.patch.object(qz, "find_prequantized_repos", lambda spec, **kw: {}))
     stack.enter_context(mock.patch.object(sp, "find_eagle3_head", lambda spec, arch, **kw: None))
     stack.enter_context(mock.patch.object(sp, "repo_bytes", lambda repo, token=None: None))

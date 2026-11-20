@@ -42,7 +42,7 @@ LLAMA_3B_CONFIG = {
 
 
 def _backends(**avail: bool) -> Dict[str, BackendAvailability]:
-    names = ("vllm", "sglang", "llamacpp-cuda", "llamacpp-cpu", "vllm-cpu")
+    names = ("vllm", "sglang", "llamacpp-cuda", "llamacpp-hip", "llamacpp-vulkan", "llamacpp-cpu", "vllm-cpu")
     out = {}
     for n in names:
         a = avail.get(n.replace("-", "_"), False)
@@ -67,6 +67,10 @@ def make_hw(kind: str) -> HardwareDescriptor:
         gpus = [GPUInfo(vendor="nvidia", name="NVIDIA GeForce GTX 1080", compute_capability=(6, 1),
                         vram_total_bytes=8 * GiB, vram_free_bytes=7 * GiB)]
         backends = _backends(vllm=True, llamacpp_cuda=True, llamacpp_cpu=True)  # vllm installed but unusable
+    elif kind == "rx7900xt":
+        gpus = [GPUInfo(vendor="amd", name="AMD Radeon RX 7900 XT", index=1, uuid="GPU-6bdce6ea1d388c5c",
+                        vram_total_bytes=20 * GiB, vram_free_bytes=19 * GiB)]
+        backends = _backends(llamacpp_hip=True, llamacpp_vulkan=True, llamacpp_cpu=True)
     elif kind in ("cpu", "cpu-avx512"):
         gpus = []
         backends = _backends(llamacpp_cpu=True, vllm_cpu=(kind == "cpu-avx512"))
@@ -88,6 +92,11 @@ def hw_rtx4090():
 @pytest.fixture
 def hw_gtx1080():
     return make_hw("gtx1080")
+
+
+@pytest.fixture
+def hw_rx7900xt():
+    return make_hw("rx7900xt")
 
 
 @pytest.fixture
@@ -144,7 +153,7 @@ def no_network(monkeypatch, llama3b_arch):
     monkeypatch.setattr(vl, "vllm_registry_archs", lambda: None)
     monkeypatch.setattr(sg, "sglang_registry_archs", lambda: None)
     monkeypatch.setattr(lc, "search_hub_gguf", lambda spec, quants, **kw: {})
-    monkeypatch.setattr(lc, "llama_server_binary", lambda: "/usr/local/bin/llama-server")
+    monkeypatch.setattr(lc, "llama_server_binary", lambda backend=None: "/usr/local/bin/llama-server")
     import rigtune.quantized as qz
 
     monkeypatch.setattr(qz, "find_prequantized_repos", lambda spec, **kw: {})

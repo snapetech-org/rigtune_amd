@@ -8,6 +8,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,31 @@ from rigtune.memory import HOST_TIER_RESERVE, MemoryModel
 from rigtune.models import Config, HardwareDescriptor, ModelSpec, PreparedModel
 
 logger = logging.getLogger(__name__)
+
+GPU_SELECTION_KEYS = ("rigtune_gpu_vendor", "rigtune_gpu_index", "rigtune_gpu_hip_uuid", "rigtune_gpu_pci_bus_id")
+
+
+def gpu_selection_extra(hw: HardwareDescriptor) -> Dict[str, object]:
+    """Persist the AMD device identity through candidate configs without emitting CLI flags for it."""
+    gpu = hw.gpu
+    if gpu is None or gpu.vendor != "amd":
+        return {}
+    extra: Dict[str, object] = {"rigtune_gpu_vendor": "amd", "rigtune_gpu_index": gpu.index}
+    if gpu.hip_uuid:
+        extra["rigtune_gpu_hip_uuid"] = gpu.hip_uuid
+    if gpu.pci_bus_id:
+        extra["rigtune_gpu_pci_bus_id"] = gpu.pci_bus_id
+    return extra
+
+
+def gpu_selection_env(extra: Dict[str, object]) -> Dict[str, str]:
+    """Restrict a ROCm engine to the AMD device selected during planning."""
+    if extra.get("rigtune_gpu_vendor") != "amd":
+        return {}
+    selector = extra.get("rigtune_gpu_hip_uuid") or extra.get("rigtune_gpu_index")
+    if selector is None:
+        return {}
+    return {"ROCR_VISIBLE_DEVICES": str(selector), "HIP_VISIBLE_DEVICES": "0"}
 
 
 @dataclass
@@ -35,6 +61,9 @@ class LlmtraceHooks:
     model_name: Optional[str] = None  # value to put in the "model" field of requests
     tokenizer_id: Optional[str] = None  # HF id whose tokenizer counts tokens when usage is absent
     gpu_ids: List[int] = field(default_factory=list)  # NVML indices llmtrace should sample
+    gpu_vendor: Optional[str] = None
+    gpu_bdf: Optional[str] = None
+    gpu_uuid: Optional[str] = None
     process_memory: bool = False  # sample RSS of the backend process (CPU backends)
     # Prometheus endpoint with prefix-cache counters (vLLM), read around each level of a session file whose replies
     # carry no cached-token counts.
@@ -68,6 +97,7 @@ class Process:
         self.log_path = log_path
         self._proc: Optional[subprocess.Popen] = None
         self._log_fh = None
+        self._stop_lock = threading.Lock()
         self.started_at: Optional[float] = None
         self.ready_at: Optional[float] = None
 
@@ -136,38 +166,38 @@ class Process:
         return False
 
     def stop(self, grace: float = 15.0) -> None:
-        if self._proc is None:
-            return
-        if self.alive():
-            try:
-                if sys.platform != "win32":
-                    os.killpg(self._proc.pid, signal.SIGTERM)  # own session: group id == server pid
-                else:
-                    self._proc.terminate()
-            except Exception:
-                pass
-            try:
-                self._proc.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
+        with self._stop_lock:
+            if self._proc is None:
+                return
+            if self.alive():
                 try:
                     if sys.platform != "win32":
-                        os.killpg(self._proc.pid, signal.SIGKILL)
+                        os.killpg(self._proc.pid, signal.SIGTERM)  # own session: group id == server pid
                     else:
-                        self._proc.kill()
+                        self._proc.terminate()
                 except Exception:
                     pass
-                self._proc.wait(timeout=10)
-        if sys.platform != "win32":
-            # The server can be gone while its children are not: a vLLM API server that died leaves
-            # VLLM::EngineCore holding the GPU, and every later trial then sees less memory. The
-            # children share the server's process group, so reap whatever is left of it.
-            try:
-                os.killpg(self._proc.pid, signal.SIGKILL)
-            except OSError:
-                pass
-        if self._log_fh:
-            self._log_fh.close()
-            self._log_fh = None
+                try:
+                    self._proc.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    try:
+                        if sys.platform != "win32":
+                            os.killpg(self._proc.pid, signal.SIGKILL)
+                        else:
+                            self._proc.kill()
+                    except Exception:
+                        pass
+                    self._proc.wait(timeout=10)
+            if sys.platform != "win32":
+                # A vLLM API server can exit while its workers still hold the GPU. Reap any remaining
+                # members of its process group before a later trial starts.
+                try:
+                    os.killpg(self._proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            if self._log_fh:
+                self._log_fh.close()
+                self._log_fh = None
 
     def log_size(self) -> int:
         """Bytes in the log so far: where log_since starts reading the lines written after this point."""

@@ -14,11 +14,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from rigtune import kernels, paths, speculative
-from rigtune.backends.base import BaseBackend, LaunchSpec, LlmtraceHooks, ctx_grid, render_extra
+from rigtune.backends.base import (GPU_SELECTION_KEYS, BaseBackend, LaunchSpec, LlmtraceHooks, ctx_grid,
+                                   gpu_selection_env, gpu_selection_extra, render_extra)
 from rigtune.hfconfig import dtype_bytes, kv_element_bytes, load_arch
 from rigtune.memory import HybridKV, MemoryModel, estimate
 from rigtune.models import ArchInfo, Config, GiB, HardwareDescriptor, ModelSpec, PreparedModel
-from rigtune.hardware import nvlink_between
+from rigtune.hardware import ROCM_GPU_ARCHES, nvlink_between
 from rigtune.quantized import INT4_METHODS, INT8_METHODS, PREQUANTIZED, hf_weight_options
 
 # The fp8 KV-cache type offered on Ampere. It runs through FlashInfer: vLLM 0.11's default Triton
@@ -652,7 +653,17 @@ class VllmBackend(BaseBackend):
         return _engine_facts()
 
     def supports(self, hw: HardwareDescriptor, model: ModelSpec) -> bool:
-        if hw.gpu is None or hw.gpu.vendor != "nvidia" or hw.gpu.cc < (7, 5):
+        gpu = hw.gpu
+        runtime = hw.backends.get(self.name).runtime if hw.backends.get(self.name) else None
+        if gpu is None:
+            return False
+        if gpu.vendor == "nvidia":
+            if gpu.cc < (7, 5) or runtime not in (None, "cuda"):
+                return False
+        elif gpu.vendor == "amd":
+            if runtime != "rocm" or gpu.architecture not in ROCM_GPU_ARCHES:
+                return False
+        else:
             return False
         try:
             arch = load_arch(model).architecture
@@ -673,6 +684,8 @@ class VllmBackend(BaseBackend):
     # ---- prepare
 
     def precisions(self, hw: HardwareDescriptor) -> List[str]:
+        if hw.gpu is not None and hw.gpu.vendor == "amd":
+            return ["bf16", "fp16"]
         cc = hw.gpu.cc if hw.gpu else (0, 0)
         out = ["bf16" if cc >= (8, 0) else "fp16"]
         # fp8 online weight quantisation: native on Ada/Hopper, Marlin on Ampere up to vLLM 0.28.
@@ -896,7 +909,8 @@ class VllmBackend(BaseBackend):
                 for ctx in ctxs:
                     for batch in (16, 64, 256):
                         out.append(
-                            Config(backend=self.name, quant=quant, ctx=ctx, batch=batch, gpu_memory_utilization=gmu)
+                            Config(backend=self.name, quant=quant, ctx=ctx, batch=batch, gpu_memory_utilization=gmu,
+                                   extra=gpu_selection_extra(hw))
                         )
         return out
 
@@ -907,6 +921,7 @@ class VllmBackend(BaseBackend):
             ctx=min(max(4096, min_ctx), model.arch.max_position_embeddings),
             batch=256,
             gpu_memory_utilization=0.90,
+            extra=gpu_selection_extra(hw),
         )
 
     # ---- launch
@@ -950,8 +965,8 @@ class VllmBackend(BaseBackend):
             args += ["--tensor-parallel-size", str(cfg.tp)]
         if model.spec.revision and cfg.quant not in PREQUANTIZED:
             args += ["--revision", model.spec.revision]
-        args += render_extra(cfg.extra, skip=("attention_backend",))
-        env = {}
+        args += render_extra(cfg.extra, skip=("attention_backend", *GPU_SELECTION_KEYS))
+        env = gpu_selection_env(cfg.extra)
         # Kernel settings, each confirmed by the engine probe in config_refusal above. Their attention backend
         # comes first: it is the setting under test.
         kernel_args, kernel_attention = kernels.vllm_args(kernels.parse(cfg.kernels)) if cfg.kernels else ([], None)
@@ -1041,6 +1056,9 @@ class VllmBackend(BaseBackend):
             health_path="/health",
             model_name=model.spec.hf_id,  # --served-model-name
             tokenizer_id=model.spec.hf_id,
-            gpu_ids=[hw.gpu.index] if hw.gpu else [],
+            gpu_ids=[hw.gpu.index] if hw.gpu and hw.gpu.vendor == "nvidia" else [],
+            gpu_vendor=hw.gpu.vendor if hw.gpu else None,
+            gpu_bdf=hw.gpu.pci_bus_id if hw.gpu else None,
+            gpu_uuid=(hw.gpu.uuid or hw.gpu.hip_uuid) if hw.gpu else None,
             metrics_path="/metrics",  # vllm:prefix_cache_queries and vllm:prefix_cache_hits, on by default
         )

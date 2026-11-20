@@ -13,12 +13,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from rigtune import kernels, kvtier, speculative
-from rigtune.backends.base import BaseBackend, LaunchSpec, LlmtraceHooks, ctx_grid, render_extra
+from rigtune.backends.base import (GPU_SELECTION_KEYS, BaseBackend, LaunchSpec, LlmtraceHooks, ctx_grid,
+                                   gpu_selection_env, gpu_selection_extra, render_extra)
 from rigtune.backends.vllm import FALLBACK_ARCHS, PAGED_KV_FRACTION
 from rigtune.hfconfig import dtype_bytes, load_arch
 from rigtune.memory import HOST_TIER_RESERVE, MIN_SAFETY_MARGIN, HybridKV, MemoryModel, estimate
 from rigtune.models import ArchInfo, Config, GiB, HardwareDescriptor, ModelSpec, PreparedModel
-from rigtune.hardware import nvlink_between, sglang_python
+from rigtune.hardware import ROCM_GPU_ARCHES, nvlink_between, sglang_python
 from rigtune.quantized import INT4_METHODS, hf_weight_options
 
 logger = logging.getLogger(__name__)
@@ -510,7 +511,17 @@ class SglangBackend(BaseBackend):
         return _engine_facts()
 
     def supports(self, hw: HardwareDescriptor, model: ModelSpec) -> bool:
-        if hw.gpu is None or hw.gpu.vendor != "nvidia" or hw.gpu.cc < (7, 5):
+        gpu = hw.gpu
+        runtime = hw.backends.get(self.name).runtime if hw.backends.get(self.name) else None
+        if gpu is None:
+            return False
+        if gpu.vendor == "nvidia":
+            if gpu.cc < (7, 5) or runtime not in (None, "cuda"):
+                return False
+        elif gpu.vendor == "amd":
+            if runtime != "rocm" or gpu.architecture not in ROCM_GPU_ARCHES:
+                return False
+        else:
             return False
         try:
             arch = load_arch(model).architecture
@@ -527,6 +538,8 @@ class SglangBackend(BaseBackend):
         return arch in FALLBACK_ARCHS or arch == "unknown"
 
     def precisions(self, hw: HardwareDescriptor) -> List[str]:
+        if hw.gpu is not None and hw.gpu.vendor == "amd":
+            return ["bf16", "fp16"]
         cc = hw.gpu.cc if hw.gpu else (0, 0)
         out = ["bf16" if cc >= (8, 0) else "fp16"]
         if cc >= (8, 9):  # SGLang fp8 path targets Ada/Hopper
@@ -619,7 +632,8 @@ class SglangBackend(BaseBackend):
                 for ctx in ctxs:
                     for batch in (16, 64, 256):
                         out.append(
-                            Config(backend=self.name, quant=quant, ctx=ctx, batch=batch, gpu_memory_utilization=frac)
+                            Config(backend=self.name, quant=quant, ctx=ctx, batch=batch, gpu_memory_utilization=frac,
+                                   extra=gpu_selection_extra(hw))
                         )
         return out
 
@@ -630,6 +644,7 @@ class SglangBackend(BaseBackend):
             ctx=min(max(4096, min_ctx), model.arch.max_position_embeddings),
             batch=256,
             gpu_memory_utilization=0.88,
+            extra=gpu_selection_extra(hw),
         )
 
     def kernels_same_as_default(self, cfg: Config, hw: HardwareDescriptor) -> Optional[str]:
@@ -681,10 +696,10 @@ class SglangBackend(BaseBackend):
             args += ["--tp-size", str(cfg.tp)]
         if revision:
             args += ["--revision", revision]
-        args += render_extra(cfg.extra)
+        args += render_extra(cfg.extra, skip=GPU_SELECTION_KEYS)
         if cfg.kernels is not None:
             args += kernels.sglang_args(kernels.parse(cfg.kernels))
-        env = {}
+        env = gpu_selection_env(cfg.extra)
         # PCIe-only GPUs: peer-to-peer can hang at start-up inside containers. Measured on a pair of
         # A40s: NCCL's P2P path hangs at init, and with only that disabled the engine's custom
         # all-reduce (CUDA IPC, also P2P) hangs next. With both off it starts in under a minute.
@@ -855,5 +870,8 @@ class SglangBackend(BaseBackend):
             health_path="/health",
             model_name=model.spec.hf_id,  # --served-model-name
             tokenizer_id=model.spec.hf_id,
-            gpu_ids=[hw.gpu.index] if hw.gpu else [],
+            gpu_ids=[hw.gpu.index] if hw.gpu and hw.gpu.vendor == "nvidia" else [],
+            gpu_vendor=hw.gpu.vendor if hw.gpu else None,
+            gpu_bdf=hw.gpu.pci_bus_id if hw.gpu else None,
+            gpu_uuid=(hw.gpu.uuid or hw.gpu.hip_uuid) if hw.gpu else None,
         )

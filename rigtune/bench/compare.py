@@ -340,10 +340,7 @@ def file_sha256(path: Path) -> str:
 
 
 def _own_checkout() -> Optional[Callable[..., str]]:
-    """git, run in rigtune's own checkout, when rigtune runs from one; None otherwise. The checkout must be
-    rigtune's own (its top level holds rigtune/ and a pyproject.toml naming rigtune): an installed copy can
-    sit inside some other repository, such as a home directory kept in git, whose state would mean nothing
-    here."""
+    """Return git for this project checkout; ignore an installed copy inside another repository."""
     here = Path(__file__).resolve().parent.parent  # the rigtune package directory
 
     def git(*args: str, text: bool = True) -> Any:
@@ -356,7 +353,9 @@ def _own_checkout() -> Optional[Callable[..., str]]:
         project = (top / "pyproject.toml").read_text(encoding="utf-8")
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    if here.parent.resolve() != top.resolve() or 'name = "rigtune"' not in project:
+    if here.parent.resolve() != top.resolve() or not any(
+        f'name = "{name}"' in project for name in ("rigtune", "rigtune-amd")
+    ):
         return None
     return git
 
@@ -500,15 +499,18 @@ def copy_inputs(target: Path, files: Dict[str, Optional[Path]]) -> Dict[str, str
 
 
 def gpu_state() -> List[Dict[str, Any]]:
-    """Each NVIDIA GPU's power limit, temperature and SM clock now, from nvidia-smi; [] when it cannot be
-    read. Recorded at the start of every run under compare --verdict: a card that starts a run hot or capped
-    measures differently."""
+    """Each visible GPU's starting cap and available thermal/clock readings.
+
+    Recorded at the start of every run under compare --verdict: a card that starts
+    a run hot or capped measures differently.
+    """
+    amd_state = _amd_gpu_state()
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=index,power.limit,temperature.gpu,clocks.sm",
                               "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10,
                              check=True).stdout
     except (OSError, subprocess.SubprocessError):
-        return []
+        return amd_state
 
     def number(x: str) -> Optional[float]:
         try:
@@ -522,6 +524,45 @@ def gpu_state() -> List[Dict[str, Any]]:
         if len(fields) == 4:
             state.append({"index": int(number(fields[0]) or 0), "power_limit_w": number(fields[1]),
                           "temperature_c": number(fields[2]), "sm_clock_mhz": number(fields[3])})
+    return state + amd_state
+
+
+def _amd_gpu_state() -> List[Dict[str, Any]]:
+    """AMD SMI cap and PCI-selected sysfs sensors for comparison provenance; read-only."""
+    from rigtune.amd import normalize_pci_bus_id, read_sysfs_metrics
+    from rigtune.hardware import _amd_smi_binary, _amd_smi_gpu_data, _amd_smi_int, _amd_smi_json
+
+    binary = _amd_smi_binary()
+    if not binary:
+        return []
+    listing = _amd_smi_json(binary, "list", "--enumeration")
+    static = _amd_smi_gpu_data(_amd_smi_json(binary, "static", "--limit"))
+    if not isinstance(listing, list):
+        return []
+    state = []
+    for item in listing:
+        if not isinstance(item, dict) or not item.get("bdf"):
+            continue
+        try:
+            smi_index = int(item["gpu"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        hip_id = _amd_smi_int(item.get("hip_id"))
+        limits = static.get(smi_index, {}).get("limit", {})
+        ppt0 = limits.get("ppt0", {}) if isinstance(limits, dict) else {}
+        reading = read_sysfs_metrics(str(item["bdf"]))
+        state.append({
+            "vendor": "amd",
+            "index": hip_id if hip_id is not None else smi_index,
+            "pci_bus_id": normalize_pci_bus_id(str(item["bdf"])),
+            "power_limit_w": _amd_smi_int(ppt0.get("socket_power_limit")) if isinstance(ppt0, dict) else None,
+            "temperature_c": reading.junction_temp_c,
+            "junction_temp_c": reading.junction_temp_c,
+            "power_w": reading.power_w,
+            "sm_clock_mhz": reading.clock_mhz,
+            "memory_used_mb": reading.memory_used_mb,
+            "gpu_util_pct": reading.utilization_pct,
+        })
     return state
 
 
@@ -563,19 +604,40 @@ def provenance(hw: HardwareDescriptor, files: Dict[str, Optional[Path]], *, mode
     rows' data, where the copied prompt files and the engine logs are. Every run's start and end, its place
     in its round, the GPUs' power limit and temperature at its start, and its engine logs are in its
     RunRecord; its requests are in <name>.requests/."""
+    gpu_records = []
+    for gpu in hw.gpus:
+        record = {"name": gpu.name, "driver_version": gpu.driver_version, "cuda_version": gpu.cuda_version,
+                  "vram_total_bytes": gpu.vram_total_bytes}
+        if gpu.vendor == "amd":
+            record.update(vendor="amd", architecture=gpu.architecture, pci_bus_id=gpu.pci_bus_id, index=gpu.index)
+        gpu_records.append(record)
+    engine_records = {}
+    for name, backend in sorted(hw.backends.items()):
+        if not backend.available:
+            continue
+        record = {"version": backend.version, "libs": dict(sorted(backend.libs.items()))}
+        if backend.runtime is not None:
+            record["runtime"] = backend.runtime
+        if backend.gpu_architecture is not None:
+            record["gpu_architecture"] = backend.gpu_architecture
+        if backend.validation_level is not None:
+            record["validation_level"] = backend.validation_level
+        engine_records[name] = record
     out: Dict[str, Any] = {
         "rigtune_version": __version__,
         "rigtune_commit": rigtune_commit(),
         "os": hw.os,
         "python": hw.python,
-        "gpus": [{"name": g.name, "driver_version": g.driver_version, "cuda_version": g.cuda_version,
-                  "vram_total_bytes": g.vram_total_bytes} for g in hw.gpus],
-        "engines": {name: {"version": b.version, "libs": dict(sorted(b.libs.items()))}
-                    for name, b in sorted(hw.backends.items()) if b.available},
+        "gpus": gpu_records,
+        "engines": engine_records,
         "files": {role: {"name": p.name, "sha256": file_sha256(p)}
                   for role, p in files.items() if p is not None},
         "launch_args_port": "launch_args show port 0; each run's engine got a free port in its place",
     }
+    selected = hw.gpu
+    if selected is not None and selected.vendor == "amd":
+        out["selected_gpu"] = {"vendor": "amd", "index": selected.index, "name": selected.name,
+                               "pci_bus_id": selected.pci_bus_id, "architecture": selected.architecture}
     if out["rigtune_commit"] and out["rigtune_commit"].endswith("+dirty"):
         out["rigtune_diff_sha256"] = rigtune_diff_sha256()
     if model is not None:

@@ -3,13 +3,13 @@
 ## Setup
 
 ```bash
-git clone https://github.com/Aagam-Bothara/rigtune.git && cd rigtune
+git clone https://github.com/snapetech-org/rigtune_amd.git && cd rigtune_amd
 pip install -e ".[dev]"
 pytest                                  # no GPU or backend needed
 ruff check rigtune tests benchmarks
 ```
 
-CI runs both on Python 3.10–3.13 for every push and pull request.
+CI runs on Python 3.10–3.13 for every push and pull request. The package installs as `rigtune-amd`; `rigtune` remains the compatible command name, and `rigtune-amd` is an alias.
 
 ## Tests
 
@@ -25,6 +25,8 @@ Recorded calibrations are evidence for the search as well as for the numbers. `P
 
 Implement the `Backend` interface in [docs/usage.md](docs/usage.md#backend-interface), register it with the selector, and give it a memory model the planner can use. The core pipeline (probe, plan, calibrate, serve) does not change.
 
+AMD GPU validation uses a local llama.cpp HIP/ROCm build; CPU-only tests and packaging run on public GitHub-hosted runners. Vulkan support is exposed when a Vulkan-enabled llama.cpp build is installed. Do not add a self-hosted GPU runner requirement to public pull-request workflows.
+
 ## Benchmark claims
 
 A number goes into [docs/benchmarks.md](docs/benchmarks.md) only if it was measured like this:
@@ -38,12 +40,7 @@ State the GPU, engine versions and date. Report failures, losses and ties as wel
 
 ## Releasing
 
-Publishing a GitHub release uploads the package to PyPI through trusted publishing ([.github/workflows/release.yml](.github/workflows/release.yml)); no API token is stored anywhere. CI builds the package and runs `twine check --strict` on every push, so a release should not fail on packaging.
-
-One-time setup on pypi.org, under Account settings, Publishing: add a pending publisher with project name `rigtune`, owner `Aagam-Bothara`, repository `rigtune`, workflow `release.yml` and environment `pypi`. Then, for each release:
-
-1. Set `version` in `pyproject.toml` and push.
-2. Create a GitHub release with a tag `v<version>` (for example `v0.1.0`); the workflow builds, checks and publishes it.
+The release workflow builds and validates a distribution artifact on a GitHub-hosted runner. This fork does not publish to PyPI.
 
 llmtrace, the GPU tracer rigtune prefers for telemetry, is not a dependency on PyPI: the name `llmtrace` there belongs to an unrelated project, and PyPI refuses git dependencies. Without it rigtune samples the GPU through `pynvml` (the `nvml` extra) or falls back to process-level `psutil` numbers.
 

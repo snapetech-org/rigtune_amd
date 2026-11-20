@@ -44,7 +44,7 @@ def two_gpus(kind: str = "a100"):
 def test_prefill_knob_reaches_every_engine(hw_a100, prepared_vllm, prepared_llamacpp, monkeypatch):
     import rigtune.backends.llamacpp as lc
 
-    monkeypatch.setattr(lc, "llama_server_binary", lambda: "/opt/llama-server")
+    monkeypatch.setattr(lc, "llama_server_binary", lambda backend=None: "/opt/llama-server")
     v = get_backend("vllm").launch_spec(Config(backend="vllm", quant="fp8", ctx=4096, batch=64, prefill_budget=16384),
                                         prepared_vllm, 9000).args
     assert v[v.index("--max-num-batched-tokens") + 1] == "16384"

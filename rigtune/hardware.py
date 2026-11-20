@@ -21,7 +21,11 @@ from rigtune.models import BackendAvailability, CPUInfo, GPUInfo, HardwareDescri
 
 logger = logging.getLogger(__name__)
 
-BACKEND_NAMES = ("vllm", "sglang", "llamacpp-cuda", "llamacpp-cpu", "vllm-cpu")
+BACKEND_NAMES = (
+    "vllm", "sglang", "llamacpp-cuda", "llamacpp-hip", "llamacpp-vulkan", "llamacpp-cpu", "vllm-cpu"
+)
+ROCM_GPU_ARCHES = frozenset({"gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1150", "gfx1151",
+                             "gfx1200", "gfx1201"})
 
 
 # --------------------------------------------------------------------------- GPU
@@ -64,6 +68,13 @@ def _probe_gpus_pynvml() -> List[GPUInfo]:
                     uuid = uuid.decode()
             except Exception:
                 uuid = None
+            try:
+                pci = pynvml.nvmlDeviceGetPciInfo(h)
+                pci_bus_id = getattr(pci, "busId", None)
+                if isinstance(pci_bus_id, bytes):
+                    pci_bus_id = pci_bus_id.decode()
+            except Exception:
+                pci_bus_id = None
             gpus.append(
                 GPUInfo(
                     vendor="nvidia",
@@ -75,6 +86,7 @@ def _probe_gpus_pynvml() -> List[GPUInfo]:
                     driver_version=str(driver),
                     cuda_version=cuda_version,
                     uuid=uuid,
+                    pci_bus_id=str(pci_bus_id) if pci_bus_id else None,
                 )
             )
     finally:
@@ -141,6 +153,7 @@ def _probe_gpus_torch() -> List[GPUInfo]:
                     vram_total_bytes=int(total),
                     vram_free_bytes=int(free),
                     cuda_version=getattr(torch.version, "cuda", None),
+                    architecture=(str(getattr(props, "gcnArchName", "")).split(":", 1)[0] or None),
                 )
             )
         return gpus
@@ -192,32 +205,265 @@ def _probe_gpus_nvidia_smi() -> List[GPUInfo]:
     return gpus
 
 
-def visible_gpus(gpus: List[GPUInfo]) -> List[GPUInfo]:
-    """Apply CUDA_VISIBLE_DEVICES, which NVML ignores but every backend obeys.
+def _rocm_smi_binary() -> Optional[str]:
+    for candidate in (shutil.which("rocm-smi"), "/opt/rocm/bin/rocm-smi"):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
-    Without this the probe reports a GPU that vLLM and llama.cpp cannot actually use, the
-    selector picks a CUDA backend, and the launch fails. An empty or "-1" value means the
-    machine is CPU-only as far as the backends are concerned.
-    """
-    env = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if env is None:
-        return gpus
-    wanted = [t.strip() for t in env.split(",") if t.strip()]
-    if not wanted or wanted == ["-1"]:
-        return []
-    out = []
-    for g in gpus:
-        if str(g.index) in wanted or (g.uuid and any(g.uuid == w or g.uuid.startswith(w) for w in wanted)):
-            out.append(g)
+
+def _amd_smi_binary() -> Optional[str]:
+    for candidate in (shutil.which("amd-smi"), "/opt/rocm/bin/amd-smi"):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _amd_smi_json(binary: str, *args: str) -> Optional[object]:
+    try:
+        out = subprocess.run([binary, *args, "--json"], capture_output=True, text=True, timeout=20, check=True)
+        raw = out.stdout.strip()
+        return json.loads(raw) if raw else None
+    except Exception as exc:
+        logger.debug("amd-smi %s failed: %s", " ".join(args), exc)
+        return None
+
+
+def _amd_smi_gpu_data(raw: object) -> Dict[int, dict]:
+    if not isinstance(raw, dict) or not isinstance(raw.get("gpu_data"), list):
+        return {}
+    out = {}
+    for item in raw["gpu_data"]:
+        if isinstance(item, dict):
+            try:
+                out[int(item["gpu"])] = item
+            except (KeyError, TypeError, ValueError):
+                continue
     return out
 
 
-def probe_gpus() -> List[GPUInfo]:
-    for fn in (_probe_gpus_pynvml, _probe_gpus_torch, _probe_gpus_nvidia_smi):
-        gpus = fn()
+def _amd_smi_int(value: object, *, multiplier: int = 1) -> Optional[int]:
+    if isinstance(value, dict):
+        value = value.get("value")
+    try:
+        if value is None or str(value).strip().casefold() in ("", "n/a", "na", "none"):
+            return None
+        return int(float(str(value).replace(",", "")) * multiplier)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_amd_smi_inventory(list_raw: object, static_raw: object, metric_raw: object = None) -> List[GPUInfo]:
+    """Join ``amd-smi list -e --json`` with ``amd-smi static -a -v --json``.
+
+    The AMD-SMI ID is not necessarily the HIP runtime ID. Keep the former only as a final
+    fallback and use ``hip_id`` for launch ordering; the PCI BDF and UUID are stable identities.
+    """
+    if not isinstance(list_raw, list):
+        return []
+    static = _amd_smi_gpu_data(static_raw)
+    metrics = _amd_smi_gpu_data(metric_raw)
+    gpus: List[GPUInfo] = []
+    seen: set[str] = set()
+    for item in list_raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            smi_index = int(item["gpu"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        details = static.get(smi_index, {})
+        asic = details.get("asic") if isinstance(details.get("asic"), dict) else {}
+        vram = details.get("vram") if isinstance(details.get("vram"), dict) else {}
+        name = str(asic.get("market_name") or "").strip()
+        if not name:
+            continue
+        memory = metrics.get(smi_index, {}).get("mem_usage", {})
+        total_mb = _amd_smi_int(memory.get("total_visible_vram") or memory.get("total_vram"))
+        free_mb = _amd_smi_int(memory.get("free_visible_vram") or memory.get("free_vram"))
+        raw_size = vram.get("size") if isinstance(vram, dict) else None
+        size_mb = total_mb if total_mb is not None else _amd_smi_int(raw_size)
+        hip_id = _amd_smi_int(item.get("hip_id"))
+        node_id = _amd_smi_int(item.get("node_id"))
+        index = hip_id if hip_id is not None else max(0, (node_id or smi_index + 1) - 1)
+        total = size_mb * 1024 * 1024 if size_mb is not None else 0
+        free = free_mb * 1024 * 1024 if free_mb is not None else None
+        hip_uuid = str(item.get("hip_uuid") or "").strip()
+        uuid = str(item.get("uuid") or "").strip() or None
+        physical_id = str(item.get("bdf") or uuid or hip_uuid or smi_index).casefold()
+        if physical_id in seen:
+            continue
+        seen.add(physical_id)
+        gpus.append(GPUInfo(
+            vendor="amd",
+            name=name,
+            index=index,
+            vram_total_bytes=total,
+            vram_free_bytes=free,
+            uuid=uuid,
+            hip_uuid=hip_uuid or None,
+            pci_bus_id=str(item.get("bdf") or "").strip() or None,
+            architecture=str(asic.get("target_graphics_version") or "").strip() or None,
+        ))
+    return sorted(gpus, key=lambda gpu: (gpu.index, gpu.name.casefold()))
+
+
+def _probe_gpus_amd_smi() -> List[GPUInfo]:
+    smi = _amd_smi_binary()
+    if not smi:
+        return []
+    listing = _amd_smi_json(smi, "list", "--enumeration")
+    static = _amd_smi_json(smi, "static", "--asic", "--vram")
+    metrics = _amd_smi_json(smi, "metric", "--mem-usage")
+    return _parse_amd_smi_inventory(listing, static, metrics)
+
+
+def _merge_amd_inventory(primary: List[GPUInfo], fallback: List[GPUInfo]) -> List[GPUInfo]:
+    """Keep AMD-SMI identities while filling memory readings from ROCm-SMI where available."""
+    if not primary:
+        return fallback
+    by_index = {gpu.index: gpu for gpu in fallback}
+    merged = []
+    for gpu in primary:
+        other = by_index.pop(gpu.index, None)
+        if other is not None:
+            gpu = gpu.model_copy(update={
+                "vram_total_bytes": gpu.vram_total_bytes or other.vram_total_bytes,
+                "vram_free_bytes": gpu.vram_free_bytes if gpu.vram_free_bytes is not None else other.vram_free_bytes,
+                "uuid": gpu.uuid or other.uuid,
+                "hip_uuid": gpu.hip_uuid or other.hip_uuid,
+                "pci_bus_id": gpu.pci_bus_id or other.pci_bus_id,
+            })
+        merged.append(gpu)
+    merged.extend(by_index.values())
+    return sorted(merged, key=lambda gpu: (gpu.index, gpu.name.casefold()))
+
+
+def _parse_rocm_smi_json(raw: str) -> List[GPUInfo]:
+    """Parse `rocm-smi --showproductname --showmeminfo vram --showuniqueid --json`.
+
+    Node ID follows the ROCm runtime's device ordering (card1 can be ROCm0), unlike the
+    DRM card number. Prefer the hardware UUID for pinning because it survives either order.
+    """
+    try:
+        data = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    gpus: List[GPUInfo] = []
+    for key, item in data.items():
+        match = re.fullmatch(r"card(\d+)", str(key), re.I)
+        if not match or not isinstance(item, dict):
+            continue
+        vendor = str(item.get("Card Vendor", ""))
+        if "amd" not in vendor.lower() and "ati" not in vendor.lower():
+            continue
+        name = str(item.get("Card Series") or item.get("Card Model") or "AMD GPU").strip()
+        try:
+            total = int(item.get("VRAM Total Memory (B)", 0))
+            used = int(item.get("VRAM Total Used Memory (B)", 0))
+        except (TypeError, ValueError):
+            total, used = 0, 0
+        try:
+            index = max(0, int(item.get("Node ID", int(match.group(1)) + 1)) - 1)
+        except (TypeError, ValueError):
+            index = int(match.group(1))
+        raw_uuid = str(item.get("Unique ID", "")).strip().lower()
+        raw_uuid = re.sub(r"^0x", "", raw_uuid)
+        uuid = f"GPU-{raw_uuid}" if raw_uuid and raw_uuid.strip("0") else None
+        gpus.append(GPUInfo(
+            vendor="amd", name=name, index=index, vram_total_bytes=total,
+            vram_free_bytes=max(0, total - used), uuid=uuid,
+            hip_uuid=uuid,
+            pci_bus_id=str(item.get("PCI Bus") or item.get("PCI Bus ID") or "").strip() or None,
+        ))
+    return sorted(gpus, key=lambda gpu: (gpu.index, gpu.name.casefold()))
+
+
+def _probe_gpus_rocm_smi() -> List[GPUInfo]:
+    smi = _rocm_smi_binary()
+    if not smi:
+        return []
+    commands = (
+        [smi, "--showproductname", "--showmeminfo", "vram", "--showuniqueid", "--json"],
+        [smi, "--json"],
+    )
+    for cmd in commands:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except Exception as exc:
+            logger.debug("rocm-smi probe failed: %s", exc)
+            continue
+        gpus = _parse_rocm_smi_json(out.stdout)
         if gpus:
-            return visible_gpus(gpus)
+            return gpus
     return []
+
+
+def _visible_subset(gpus: List[GPUInfo], env: str, *, indices_are_relative: bool = False) -> List[GPUInfo]:
+    wanted = [token.strip() for token in env.split(",") if token.strip()]
+    if not wanted or wanted == ["-1"]:
+        return []
+    if indices_are_relative:
+        selected = set()
+        for token in wanted:
+            if token.isdigit() and int(token) < len(gpus):
+                selected.add(int(token))
+        return [gpu for i, gpu in enumerate(gpus) if i in selected]
+    out = []
+    for gpu in gpus:
+        for token in wanted:
+            if token.isdigit() and str(gpu.index) == token:
+                out.append(gpu)
+                break
+            if gpu.uuid and (gpu.uuid.casefold() == token.casefold()
+                             or gpu.uuid.casefold().removeprefix("gpu-").startswith(token.casefold().removeprefix("gpu-"))):
+                out.append(gpu)
+                break
+            if gpu.hip_uuid and (gpu.hip_uuid.casefold() == token.casefold()
+                                 or gpu.hip_uuid.casefold().removeprefix("gpu-").startswith(
+                                     token.casefold().removeprefix("gpu-"))):
+                out.append(gpu)
+                break
+    return out
+
+
+def visible_gpus(gpus: List[GPUInfo]) -> List[GPUInfo]:
+    """Apply the vendor visibility masks, which inventory tools may otherwise ignore.
+
+    ROCm and CUDA use different masks. When both ROCm masks are set, HIP_VISIBLE_DEVICES
+    applies to the list already filtered by ROCR_VISIBLE_DEVICES.
+    """
+    nvidia = [gpu for gpu in gpus if gpu.vendor == "nvidia"]
+    amd = [gpu for gpu in gpus if gpu.vendor == "amd"]
+    other = [gpu for gpu in gpus if gpu.vendor not in ("nvidia", "amd")]
+    cuda_mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_mask is not None:
+        nvidia = _visible_subset(nvidia, cuda_mask)
+    rocr_mask = os.environ.get("ROCR_VISIBLE_DEVICES")
+    hip_mask = os.environ.get("HIP_VISIBLE_DEVICES")
+    if rocr_mask is not None:
+        amd = _visible_subset(amd, rocr_mask)
+        if hip_mask is not None:
+            amd = _visible_subset(amd, hip_mask, indices_are_relative=True)
+    elif hip_mask is not None:
+        amd = _visible_subset(amd, hip_mask)
+    return sorted(nvidia + amd + other, key=lambda gpu: (gpu.index, gpu.name.casefold()))
+
+
+def probe_gpus() -> List[GPUInfo]:
+    # Prefer AMD SMI's PCI BDF, UUID, and HIP ordering; ROCm SMI remains the compatibility fallback.
+    # NVML and AMD SMI describe different vendors, so combine them on mixed hosts.
+    amd = _probe_gpus_amd_smi()
+    if not amd or any(gpu.vram_free_bytes is None for gpu in amd):
+        amd = _merge_amd_inventory(amd, _probe_gpus_rocm_smi())
+    gpus = _probe_gpus_pynvml() + amd
+    if not gpus:
+        gpus = _probe_gpus_torch()
+    if not gpus:
+        gpus = _probe_gpus_nvidia_smi()
+    return visible_gpus(gpus)
 
 
 # --------------------------------------------------------------------------- CPU
@@ -374,11 +620,22 @@ def _pkg_version(name: str) -> Optional[str]:
         return None
 
 
-def llama_server_binary() -> Optional[str]:
-    """Path to llama-server; honours $LLAMA_SERVER."""
-    env = os.environ.get("LLAMA_SERVER")
-    if env and os.path.exists(env):
-        return env
+def llama_server_binary(backend: Optional[str] = None) -> Optional[str]:
+    """Path to llama-server, preferring a backend-specific override when supplied.
+
+    `LLAMA_SERVER` remains the common override. `LLAMA_SERVER_HIP`,
+    `LLAMA_SERVER_VULKAN`, and `LLAMA_SERVER_CUDA` allow separate builds to be
+    calibrated by the same installation.
+    """
+    specific = {"hip": "LLAMA_SERVER_HIP", "vulkan": "LLAMA_SERVER_VULKAN", "cuda": "LLAMA_SERVER_CUDA"}
+    env_names = ([specific[backend]] if backend in specific else [])
+    env_names += ["LLAMA_SERVER"]
+    if backend is None:
+        env_names += [specific[k] for k in ("hip", "vulkan", "cuda")]
+    for name in dict.fromkeys(env_names):
+        path = os.environ.get(name)
+        if path and os.path.isfile(path):
+            return path
     for cand in ("llama-server", "llama-server.exe"):
         p = shutil.which(cand)
         if p:
@@ -386,29 +643,69 @@ def llama_server_binary() -> Optional[str]:
     return None
 
 
-def _llama_server_info(binary: str) -> Tuple[Optional[str], bool]:
-    """Return (version string, has_cuda) by invoking llama-server."""
+def _llama_server_info(binary: str) -> Tuple[Optional[str], set[str], List[Tuple[str, int, str]]]:
+    """Return the version, accelerator backends, and listed devices for a llama-server binary."""
     version: Optional[str] = None
-    has_cuda = False
+    text = ""
     try:
         out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=15)
-        text = (out.stdout or "") + (out.stderr or "")
-        m = re.search(r"version:\s*(\S+)", text)
+        version_text = (out.stdout or "") + (out.stderr or "")
+        m = re.search(r"version:\s*(\S+)", version_text)
         if m:
             version = m.group(1)
-        if re.search(r"\bCUDA\b", text, re.I):
-            has_cuda = True
+        text += "\n" + version_text
     except Exception as exc:
         logger.debug("llama-server --version failed: %s", exc)
-    if not has_cuda:
-        try:
-            out = subprocess.run([binary, "--list-devices"], capture_output=True, text=True, timeout=15)
-            text = (out.stdout or "") + (out.stderr or "")
-            if re.search(r"\bCUDA\d*\b", text):
-                has_cuda = True
-        except Exception:
-            pass
-    return version, has_cuda
+    try:
+        out = subprocess.run([binary, "--list-devices"], capture_output=True, text=True, timeout=15)
+        text += "\n" + (out.stdout or "") + "\n" + (out.stderr or "")
+    except Exception as exc:
+        logger.debug("llama-server --list-devices failed: %s", exc)
+
+    devices: List[Tuple[str, int, str]] = []
+    capabilities = set()
+    prefix_map = {"cuda": "cuda", "rocm": "hip", "hip": "hip", "vulkan": "vulkan"}
+    for line in text.splitlines():
+        match = re.match(r"\s*(CUDA|ROCm|HIP|Vulkan)(\d+)\s*:\s*(.*)$", line, re.I)
+        if not match:
+            continue
+        prefix, index, name = match.groups()
+        runtime = prefix_map[prefix.casefold()]
+        capabilities.add(runtime)
+        name = re.sub(r"\s+\(\d+\s+MiB,.*\)\s*$", "", name).strip()
+        devices.append((runtime, int(index), name))
+    # Some builds print the backend in --version even when no device is visible.
+    for prefix, runtime in prefix_map.items():
+        if re.search(rf"\b{prefix}(?:\s+backend|\s+build)?\b", text, re.I):
+            capabilities.add(runtime)
+    return version, capabilities, devices
+
+
+def llama_server_device_index(backend: str, gpu_name: str, binary: Optional[str] = None,
+                             gpu_identity: Optional[str] = None) -> Optional[int]:
+    """Find one unambiguous device in llama.cpp's list, preferring a stable identity over its name."""
+    path = binary or llama_server_binary(backend)
+    if not path:
+        return None
+    _, _, devices = _llama_server_info(path)
+    runtime_devices = [(index, name) for runtime, index, name in devices if runtime == backend and name]
+    if gpu_identity:
+        identity = re.sub(r"[^a-z0-9]", "", gpu_identity.casefold())
+        matches = [index for index, name in runtime_devices
+                   if identity and identity in re.sub(r"[^a-z0-9]", "", name.casefold())]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return None
+    needle = re.sub(r"[^a-z0-9]", "", gpu_name.casefold())
+    candidates = [(index, re.sub(r"[^a-z0-9]", "", name.casefold())) for index, name in runtime_devices]
+    exact = [index for index, listed in candidates if listed == needle and needle]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    partial = [index for index, listed in candidates if needle and (needle in listed or listed in needle)]
+    return partial[0] if len(partial) == 1 else None
 
 
 def sglang_python() -> Optional[str]:
@@ -479,69 +776,172 @@ def _torch_is_cuda_build() -> Optional[bool]:
         return None
 
 
+_TORCH_RUNTIME_CODE = (
+    "import json\n"
+    "try:\n"
+    " import torch\n"
+    " runtime = 'rocm' if getattr(torch.version, 'hip', None) else ('cuda' if getattr(torch.version, 'cuda', None) else 'cpu')\n"
+    "except Exception:\n"
+    " runtime = None\n"
+    "print(json.dumps({'runtime': runtime}))\n"
+)
+
+
+def _torch_runtime(python: Optional[str] = None) -> Optional[str]:
+    """Return the accelerator runtime compiled into the engine's PyTorch, never from device visibility."""
+    if python and python != sys.executable:
+        try:
+            out = subprocess.run([python, "-c", _TORCH_RUNTIME_CODE], capture_output=True, text=True, timeout=30)
+            if out.returncode == 0:
+                row = json.loads(out.stdout.strip().splitlines()[-1])
+                return row.get("runtime") if row.get("runtime") in ("cuda", "rocm", "cpu") else None
+        except Exception as exc:
+            logger.debug("could not identify torch runtime in %s: %s", python, exc)
+        return None
+    cuda = _torch_is_cuda_build()
+    if cuda is True:
+        return "cuda"
+    if importlib.util.find_spec("torch") is None:
+        return None
+    try:
+        import torch  # type: ignore
+
+        if getattr(torch.version, "hip", None):
+            return "rocm"
+    except Exception:
+        return None
+    return "cpu" if cuda is False else None
+
+
 def probe_backends(gpus: List[GPUInfo]) -> Dict[str, BackendAvailability]:
     out: Dict[str, BackendAvailability] = {}
     has_nvidia = any(g.vendor == "nvidia" for g in gpus)
+    has_amd = any(g.vendor == "amd" for g in gpus)
+    amd_gpu = next((gpu for gpu in gpus if gpu.vendor == "amd"), None)
+    amd_arch = amd_gpu.architecture if amd_gpu else None
+    amd_arch_supported = amd_arch in ROCM_GPU_ARCHES
 
     vllm_ver = _pkg_version("vllm")
     vllm_importable = importlib.util.find_spec("vllm") is not None
     torch_cuda = _torch_is_cuda_build()
+    vllm_runtime = _torch_runtime()
     if not vllm_importable:
         vllm_reason = "vllm not importable"
-    elif not has_nvidia:
+    elif has_amd and vllm_runtime == "cpu":
+        vllm_reason = "vLLM's PyTorch is a CPU build; an AMD GPU requires a ROCm build"
+    elif has_amd and not has_nvidia and vllm_runtime != "rocm":
+        vllm_reason = "vLLM's PyTorch is not a ROCm build for the visible AMD GPU"
+    elif has_amd and vllm_runtime == "rocm" and not amd_arch_supported:
+        vllm_reason = f"unsupported or unknown AMD GPU architecture for ROCm vLLM: {amd_arch or 'unknown'}"
+    elif not has_nvidia and not (has_amd and vllm_runtime == "rocm"):
         vllm_reason = "no usable NVIDIA GPU (check CUDA_VISIBLE_DEVICES)"
-    elif torch_cuda is False:
+    elif has_nvidia and vllm_runtime == "rocm" and not has_amd:
+        vllm_reason = "vLLM's PyTorch is a ROCm build but no AMD GPU is visible"
+    elif torch_cuda is False and vllm_runtime != "rocm":
         vllm_reason = "torch is a CPU build"
     else:
         vllm_reason = None
     vllm_libs = _libs_here() if vllm_ver else {}
     out["vllm"] = BackendAvailability(
         name="vllm",
-        available=bool(vllm_importable and has_nvidia and torch_cuda is not False),
+        available=bool(vllm_importable and ((has_nvidia and vllm_runtime in ("cuda", None))
+                                             or (has_amd and vllm_runtime == "rocm" and amd_arch_supported))),
         version=vllm_ver,
         reason=vllm_reason,
+        runtime=vllm_runtime,
+        gpu_architecture=amd_arch,
+        validation_level=("detected_only" if has_amd and vllm_runtime == "rocm" else None),
         libs=vllm_libs,
     )
     # vLLM-CPU: the same package built against a CPU-only torch.
     out["vllm-cpu"] = BackendAvailability(
         name="vllm-cpu",
-        available=bool(vllm_importable and torch_cuda is False),
+        available=bool(vllm_importable and vllm_runtime == "cpu"),
         version=vllm_ver,
         libs=dict(vllm_libs),
         reason=(
             "vllm not importable" if not vllm_importable
-            else ("torch is a CUDA build; vLLM-CPU needs the CPU wheel" if torch_cuda else None)
+            else ("torch is an accelerator build; vLLM-CPU needs the CPU wheel" if vllm_runtime != "cpu" else None)
         ),
+        runtime=vllm_runtime,
     )
 
     sgl_python = sglang_python()
     sgl_ver = _sglang_version(sgl_python) if sgl_python else None
     sgl_found = sgl_python is not None and (sgl_python == sys.executable or sgl_ver is not None)
+    sgl_runtime = _torch_runtime(sgl_python) if has_amd and sgl_found else None
+    sgl_rocm_ok = has_amd and sgl_runtime == "rocm" and amd_arch_supported
+    sgl_nvidia_ok = has_nvidia and sgl_runtime in (None, "cuda")
+    if not sgl_found:
+        sgl_reason = "sglang not found: install it here, or set $SGLANG_PYTHON to the python of an environment that has it"
+    elif sgl_runtime == "cpu":
+        sgl_reason = "SGLang's PyTorch is a CPU build"
+    elif has_amd and sgl_runtime == "rocm" and not amd_arch_supported:
+        sgl_reason = f"unsupported or unknown AMD GPU architecture for ROCm SGLang: {amd_arch or 'unknown'}"
+    elif has_amd and not has_nvidia and sgl_runtime != "rocm":
+        sgl_reason = "SGLang's PyTorch is not a ROCm build for the visible AMD GPU"
+    elif has_nvidia and sgl_runtime == "rocm" and not sgl_rocm_ok:
+        sgl_reason = "SGLang's PyTorch is a ROCm build but no supported AMD GPU is visible"
+    elif not sgl_nvidia_ok and not sgl_rocm_ok:
+        sgl_reason = "no usable NVIDIA GPU (check CUDA_VISIBLE_DEVICES)"
+    else:
+        sgl_reason = None
     out["sglang"] = BackendAvailability(
         name="sglang",
-        available=bool(sgl_found and has_nvidia),
+        available=bool(sgl_found and (sgl_nvidia_ok or sgl_rocm_ok)),
         version=sgl_ver,
+        runtime=sgl_runtime,
+        gpu_architecture=amd_arch,
+        validation_level=("detected_only" if has_amd and sgl_runtime == "rocm" else None),
         libs=_sglang_libs(sgl_python) if sgl_python and sgl_ver else {},
-        reason=("sglang not found: install it here, or set $SGLANG_PYTHON to the python of an environment that has it"
-                if not sgl_found
-                else ("no usable NVIDIA GPU (check CUDA_VISIBLE_DEVICES)" if not has_nvidia else None)),
+        reason=sgl_reason,
     )
+
+    llama_variants = (
+        ("llamacpp-cuda", "cuda", "nvidia", "CUDA"),
+        ("llamacpp-hip", "hip", "amd", "HIP/ROCm"),
+        ("llamacpp-vulkan", "vulkan", None, "Vulkan"),
+    )
+    for name, runtime, vendor, label in llama_variants:
+        binary = llama_server_binary(runtime)
+        if not binary:
+            out[name] = BackendAvailability(
+                name=name, available=False, reason=f"llama-server {label} build not found (set LLAMA_SERVER_{runtime.upper()})"
+            )
+            continue
+        ver, capabilities, devices = _llama_server_info(binary)
+        has_gpu = any(gpu.vendor == vendor for gpu in gpus) if vendor else bool(gpus)
+        if runtime in ("hip", "vulkan") and devices:
+            indices = [llama_server_device_index(runtime, gpu.name, binary,
+                                                 gpu_identity=gpu.pci_bus_id or gpu.uuid)
+                       for gpu in gpus]
+            device_matches = any(index is not None for index in indices)
+        else:
+            device_matches = has_gpu
+        if runtime not in capabilities:
+            reason = f"llama-server built without {label}"
+        elif not has_gpu:
+            reason = ("no usable NVIDIA GPU (check CUDA_VISIBLE_DEVICES)" if vendor == "nvidia"
+                      else "no usable AMD GPU (check ROCR_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES)" if vendor == "amd"
+                      else "no usable GPU is visible")
+        elif not device_matches:
+            reason = f"llama-server does not list a visible GPU for {label}"
+        else:
+            reason = None
+        out[name] = BackendAvailability(
+            name=name, available=reason is None, version=ver, reason=reason,
+            gpu_architecture=(amd_arch if has_amd and runtime in ("hip", "vulkan") else None),
+            validation_level=("detected_only" if has_amd and runtime in ("hip", "vulkan") and reason is None else None),
+        )
 
     binary = llama_server_binary()
     if binary:
-        ver, has_cuda = _llama_server_info(binary)
-        out["llamacpp-cuda"] = BackendAvailability(
-            name="llamacpp-cuda",
-            available=bool(has_cuda and has_nvidia),
-            version=ver,
-            reason=None if has_cuda else "llama-server built without CUDA",
-        )
+        ver, _, _ = _llama_server_info(binary)
         out["llamacpp-cpu"] = BackendAvailability(name="llamacpp-cpu", available=True, version=ver)
     else:
-        for n in ("llamacpp-cuda", "llamacpp-cpu"):
-            out[n] = BackendAvailability(
-                name=n, available=False, reason="llama-server not on PATH (set $LLAMA_SERVER)"
-            )
+        out["llamacpp-cpu"] = BackendAvailability(
+            name="llamacpp-cpu", available=False, reason="llama-server not on PATH (set $LLAMA_SERVER)"
+        )
     return out
 
 
@@ -568,7 +968,12 @@ def hardware_hash(hw: HardwareDescriptor) -> str:
     """
     parts = []
     for g in hw.gpus:
-        parts.append(f"gpu:{g.vendor}:{g.name}:{g.cc[0]}.{g.cc[1]}:{g.vram_total_bytes // (256 * 1024 * 1024)}")
+        # Keep the pre-AMD NVIDIA shape unchanged so adding optional device metadata does not invalidate
+        # existing hardware-keyed profiles. AMD needs its ROCm target in the key because two cards with the
+        # same marketing name can expose different supported engine and kernel sets.
+        architecture = f":{g.architecture or ''}" if g.vendor == "amd" else ""
+        parts.append(f"gpu:{g.vendor}:{g.name}:{g.cc[0]}.{g.cc[1]}{architecture}:"
+                     f"{g.vram_total_bytes // (256 * 1024 * 1024)}")
     c = hw.cpu
     parts.append(f"cpu:{c.model_name}:{c.physical_cores}:{c.logical_cores}:{int(c.avx2)}{int(c.avx512)}")
     parts.append(f"ram:{c.ram_total_bytes // (1024 * 1024 * 1024)}")

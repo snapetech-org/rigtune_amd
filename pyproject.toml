@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rigtune"
+name = "rigtune-amd"
 version = "0.3.0"
-description = "Autotuner for LLM serving: measures vLLM, SGLang and llama.cpp settings on your GPU and your traffic, then serves the fastest"
+description = "LLM serving autotuner with llama.cpp CUDA, AMD HIP/ROCm, Vulkan and CPU support"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = {text = "MIT"}
@@ -47,13 +47,14 @@ nvml = ["nvidia-ml-py>=12.535.133"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "ruff==0.15.0", "mypy==1.19.1"]
 
 [project.urls]
-Homepage = "https://github.com/Aagam-Bothara/rigtune"
-Documentation = "https://github.com/Aagam-Bothara/rigtune/blob/main/docs/usage.md"
-Benchmarks = "https://github.com/Aagam-Bothara/rigtune/blob/main/docs/benchmarks.md"
-Issues = "https://github.com/Aagam-Bothara/rigtune/issues"
+Homepage = "https://github.com/snapetech-org/rigtune_amd"
+Documentation = "https://github.com/snapetech-org/rigtune_amd/blob/main/docs/usage.md"
+Benchmarks = "https://github.com/snapetech-org/rigtune_amd/blob/main/docs/benchmarks.md"
+Issues = "https://github.com/snapetech-org/rigtune_amd/issues"
 
 [project.scripts]
 rigtune = "rigtune.cli:app"
+rigtune-amd = "rigtune.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["."]
