@@ -340,10 +340,7 @@ def file_sha256(path: Path) -> str:
 
 
 def _own_checkout() -> Optional[Callable[..., str]]:
-    """git, run in rigtune's own checkout, when rigtune runs from one; None otherwise. The checkout must be
-    rigtune's own (its top level holds rigtune/ and a pyproject.toml naming rigtune): an installed copy can
-    sit inside some other repository, such as a home directory kept in git, whose state would mean nothing
-    here."""
+    """Return git for this project checkout; ignore an installed copy inside another repository."""
     here = Path(__file__).resolve().parent.parent  # the rigtune package directory
 
     def git(*args: str, text: bool = True) -> Any:
@@ -356,7 +353,9 @@ def _own_checkout() -> Optional[Callable[..., str]]:
         project = (top / "pyproject.toml").read_text(encoding="utf-8")
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    if here.parent.resolve() != top.resolve() or 'name = "rigtune"' not in project:
+    if here.parent.resolve() != top.resolve() or not any(
+        f'name = "{name}"' in project for name in ("rigtune", "rigtune-amd")
+    ):
         return None
     return git
 

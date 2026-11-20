@@ -50,14 +50,14 @@ def reference_configs(hw: HardwareDescriptor, prepared: Dict[str, PreparedModel]
                 backend=name, quant=backend.precisions(hw)[0], ctx=max_pos, batch=256, gpu_memory_utilization=0.88
             )
         elif name.startswith("llamacpp"):
-            # `llama-server -m model-Q4_K_M.gguf`: -c 4096, -np 1, -b 2048, all layers on GPU when built with CUDA
+                # llama-server defaults: -c 4096, -np 1, -b 2048, all layers on GPU when accelerated
             quants = list(model.weights_bytes)
             quant = "Q4_K_M" if "Q4_K_M" in quants else quants[0]
             cfg = Config(
                 backend=name, quant=quant, ctx=min(4096, max_pos), batch=1,
-                n_gpu_layers=(model.arch.num_layers + 1) if backend.cuda else 0, n_batch=2048,
+                    n_gpu_layers=(model.arch.num_layers + 1) if backend.gpu_backend else 0, n_batch=2048,
             )
-            if not backend.cuda:
+            if not backend.gpu_backend:
                 cfg.extra["threads"] = hw.cpu.physical_cores
             out[f"{name}-default"] = cfg
         elif name == "vllm-cpu":

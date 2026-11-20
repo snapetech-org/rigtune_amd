@@ -18,6 +18,14 @@ def test_pascal_only_gets_llamacpp_cuda(hw_gtx1080, spec):
 
 
 @pytest.mark.usefixtures("no_network")
+def test_amd_gpu_gets_hip_and_vulkan_llamacpp(monkeypatch, hw_rx7900xt, spec):
+    import rigtune.backends.llamacpp as lc
+
+    monkeypatch.setattr(lc, "llama_server_binary", lambda backend=None: "/opt/llama-server")
+    assert select_backends(hw_rx7900xt, spec, registry()) == ["llamacpp-hip", "llamacpp-vulkan"]
+
+
+@pytest.mark.usefixtures("no_network")
 def test_cpu_without_avx512(hw_cpu, spec):
     assert select_backends(hw_cpu, spec, registry()) == ["llamacpp-cpu"]
 

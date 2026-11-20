@@ -52,6 +52,13 @@ def select_backends(
                 candidates.append("sglang")
         if ok("llamacpp-cuda"):
             candidates.append("llamacpp-cuda")
+        if ok("llamacpp-vulkan"):
+            candidates.append("llamacpp-vulkan")
+    elif gpu is not None and gpu.vendor == "amd":
+        if ok("llamacpp-hip"):
+            candidates.append("llamacpp-hip")
+        if ok("llamacpp-vulkan"):
+            candidates.append("llamacpp-vulkan")
     if gpu is None:
         if ok("llamacpp-cpu"):
             candidates.append("llamacpp-cpu")

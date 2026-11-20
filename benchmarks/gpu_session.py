@@ -88,11 +88,12 @@ INDEX = "index.json"
 FINAL = (DONE, FAILED, TIMEOUT, SKIPPED, BLOCKED, INTERRUPTED)
 NOT_LOGS = (INDEX, LOCK, ".sums-staging")  # root-level files the index does not offer as logs
 # Packages whose versions decide what a phase measured: read from metadata, so nothing is imported.
-PACKAGES = ("rigtune", "vllm", "sglang", "torch", "transformers", "flashinfer-python", "arctic-inference",
+PACKAGES = ("rigtune", "rigtune-amd", "vllm", "sglang", "torch", "transformers", "flashinfer-python", "arctic-inference",
             "nvidia-ml-py", "llm-optimizer", "aiconfigurator")
 VERSIONS_CODE = ("import importlib.metadata as m, json\nout = {}\n"
                  f"for n in {PACKAGES!r}:\n"
                  "    try: out[n] = m.version(n)\n    except m.PackageNotFoundError: out[n] = None\n"
+                 "if out.get('rigtune') is None: out['rigtune'] = out.get('rigtune-amd')\n"
                  "print(json.dumps(out))")
 
 
@@ -204,6 +205,8 @@ def installed_versions(pythons: Optional[Dict[str, str]] = None) -> Dict[str, Op
             out[name] = metadata.version(name)
         except metadata.PackageNotFoundError:
             out[name] = None
+    if out["rigtune"] is None:
+        out["rigtune"] = out["rigtune-amd"]
     others = dict(pythons or {})
     if os.environ.get("SGLANG_PYTHON") and "sglang" not in others:
         others["sglang"] = "$SGLANG_PYTHON"

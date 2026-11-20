@@ -118,7 +118,7 @@ def _rewrite() -> None:  # pragma: no cover - run by hand
         mp.setattr(vl, "vllm_registry_archs", lambda: None)
         mp.setattr(sg, "sglang_registry_archs", lambda: None)
         mp.setattr(lc, "search_hub_gguf", lambda spec, quants, **kw: {})
-        mp.setattr(lc, "llama_server_binary", lambda: "/usr/local/bin/llama-server")
+        mp.setattr(lc, "llama_server_binary", lambda backend=None: "/usr/local/bin/llama-server")
         mp.setattr(qz, "find_prequantized_repos", lambda spec, **kw: {})
         mp.setattr(sp, "find_eagle3_head", lambda spec, arch, **kw: None)
         mp.setattr(sp, "repo_bytes", lambda repo, token=None: None)

@@ -52,7 +52,7 @@ def _fake_git(monkeypatch, top, head="0123abc", status=""):
     monkeypatch.setattr(subprocess, "run", run)
 
 
-def test_the_commit_is_recorded_only_from_a_checkout_of_rigtune_itself(monkeypatch, tmp_path):
+def test_the_commit_is_recorded_only_from_a_checkout_of_rigtune_amd_itself(monkeypatch, tmp_path):
     package = Path(compare.__code__.co_filename).resolve().parent.parent
     _fake_git(monkeypatch, package.parent)
     assert rigtune_commit() == "0123abc"

@@ -19,6 +19,26 @@ flowchart LR
 
 2. **Choose candidate backends.** The [supported-hardware table](../README.md#supported-hardware) determines which backends to try. If several are available, calibration decides which one to use.
 
+### AMD GPUs with llama.cpp
+
+AMD acceleration is provided through llama.cpp builds compiled with HIP/ROCm or Vulkan. It does not make vLLM or SGLang available on AMD. `rigtune probe` checks the installed llama-server build and lists `llamacpp-hip` or `llamacpp-vulkan` only when the matching runtime and a visible GPU are available. AMD discovery uses ROCm SMI when installed; if the tool is absent, the probe may not identify AMD devices.
+
+Set a runtime-specific executable when you keep separate llama.cpp builds:
+
+```bash
+export LLAMA_SERVER_HIP=/path/to/hip/build/bin/llama-server
+# or
+export LLAMA_SERVER_VULKAN=/path/to/vulkan/build/bin/llama-server
+rigtune probe
+rigtune bench /path/to/model.gguf --backend llamacpp-hip --quant Q4_K_M
+```
+
+`LLAMA_SERVER_CUDA` works the same way for a CUDA build. If the backend-specific variable is unset, rigtune checks `LLAMA_SERVER`, then `llama-server` on `PATH`. The HIP launcher pins a selected AMD GPU by UUID where ROCm SMI exposes one, and maps that device into the child process as HIP device 0. The Vulkan launcher maps the selected GPU to llama.cpp's listed Vulkan device index. These masks isolate rigtune's calibration process; they do not change other running applications or system-wide GPU settings.
+
+For a local GGUF, rigtune reads architecture and context metadata directly from its header, so the source model config.json is not needed. If a chat_template.jinja file sits beside the GGUF, the launcher uses it with llama.cpp's Jinja mode. Set RIGTUNE_LLAMA_REASONING=off (or on / auto) when your normal server uses the matching reasoning setting.
+
+AMD hardware validation currently covers llama.cpp HIP/ROCm on an RX 7900 XT. Vulkan, other AMD cards, and AMD vLLM/SGLang are not validated by this fork.
+
 3. **Prepare the model.** vLLM and SGLang use Hugging Face weights directly, plus any pre-quantized 4-bit AWQ or GPTQ checkpoint of the same model found on the Hub. For llama.cpp, rigtune finds a pre-quantised GGUF on the Hub (Q4_K_M, Q5_K_M, Q6_K or Q8_0), or converts and quantises FP16 weights locally. It only prepares the quantizations that pass memory planning.
 
 4. **Check what fits in memory.** Before launching a backend, the planner estimates its memory needs:

@@ -127,6 +127,7 @@ class ArchInfo(BaseModel):
     sliding_window: Optional[int] = None
     linear_layers: int = 0  # linear-attention (Gated DeltaNet) layers: fixed recurrent state, no KV
     linear_state_bytes: int = 0  # recurrent state one sequence holds, summed over the linear layers
+    linear_state_bytes_llamacpp: Optional[int] = None  # llama.cpp holds recurrent state tensors in F32
     # What that state grows by per speculative token: the conv state keeps one more column for each.
     linear_conv_step_bytes: int = 0
     layout_note: Optional[str] = None  # why a hybrid-looking layout fell back to the every-layer-full estimate

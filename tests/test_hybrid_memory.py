@@ -247,19 +247,19 @@ def test_sglang_keeps_every_gemma3_layer_full(hw_rtx4090, caplog):
     assert vllm_kv == 65_536 * 131_072 + 327_680 * (1040 * 16 + 4096)
 
 
-# ---------------------------------------------------------------- engines without verified rules
+# ---------------------------------------------------------------- llama.cpp's verified hybrid rules
 
 
-def test_backends_without_hybrid_rules_keep_todays_estimate(hw_rtx4090, caplog):
+def test_llamacpp_hybrid_cache_counts_attention_kv_and_recurrent_state(hw_rtx4090):
     be = LlamaCppCudaBackend()
     mm = be.memory_model(hw_rtx4090)
     model = qwen35("llamacpp-cuda")
     model.weights_bytes = {"Q4_K_M": 5 * GiB}
     c = Config(backend="llamacpp-cuda", quant="Q4_K_M", ctx=4096, batch=4, n_gpu_layers=33)
-    assert kv(model, c, mm) == 131_072 * 4096 * 4  # every layer full, as before
-    with caplog.at_level(logging.INFO, logger="rigtune.memory"):
-        plan(hw_rtx4090, model, [c], mm)
-    assert "hybrid KV rules are not verified" in caplog.text
+    # 8 full layers x 32 KiB/token x 16,384 tokens, plus 4 F32 recurrent states per sequence.
+    assert kv(model, c, mm) == 32_768 * 16_384 + 24 * (
+        (3 * (4096 + 2 * 16 * 128) + 128 * 4096) * 4
+    ) * 4
 
 
 def test_speculation_leaves_dense_and_sliding_only_models_alone(hw_rtx4090):
@@ -367,8 +367,7 @@ def test_layout_note_only_when_the_estimate_falls_back(hw_rtx4090):
     assert layout_note(qwen25(), vllm_mm) is None  # dense
     assert layout_note(qwen35(), vllm_mm) is None  # hybrid, rules verified
     assert layout_note(gemma3("vllm"), vllm_mm) is None  # vLLM frees Gemma 3's sliding layers
-    assert "rules are not verified" in layout_note(qwen35("llamacpp-cuda"), LlamaCppCudaBackend().memory_model(
-        hw_rtx4090))
+    assert layout_note(qwen35("llamacpp-cuda"), LlamaCppCudaBackend().memory_model(hw_rtx4090)) is None
     note = layout_note(gemma3("sglang"), SglangBackend().memory_model(hw_rtx4090))
     assert note.startswith("SGLang keeps a full KV cache on every layer of Gemma3ForConditionalGeneration")
     odd = qwen35()

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import struct
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union
 
@@ -164,11 +165,16 @@ def hybrid_layout(cfg: Dict[str, Any], layers: int, model_dtype: str) -> Dict[st
     A layout is recognised only when every layer is full, sliding (with a window) or Gated DeltaNet linear
     attention. Anything else returns just a `layout_note`, so the planner keeps today's estimate.
     """
-    types = _layer_types(cfg, layers)
+    layout_layers = layers
+    if cfg.get("_gguf_block_count_includes_mtp"):
+        # llama.cpp's GGUF block_count includes the appended MTP decoder layer; the ordinary
+        # transformer layout ends before it, and engines account for that head separately.
+        layout_layers -= min(layout_layers, int(cfg.get("num_nextn_predict_layers") or 0))
+    types = _layer_types(cfg, layout_layers)
     if types is None or all(t in _FULL_TYPES for t in types):
         return {}
-    if len(types) != layers:
-        return _unrecognised(cfg, f"layer_types lists {len(types)} layers for {layers}")
+    if len(types) != layout_layers:
+        return _unrecognised(cfg, f"layer_types lists {len(types)} layers for {layout_layers}")
     unknown = sorted(set(types) - _FULL_TYPES - _SLIDING_TYPES - _LINEAR_TYPES)
     if unknown:
         return _unrecognised(cfg, f"unrecognised layer types {', '.join(unknown)}")
@@ -190,6 +196,18 @@ def hybrid_layout(cfg: Dict[str, Any], layers: int, model_dtype: str) -> Dict[st
             return _unrecognised(cfg, "linear-attention layers without Gated DeltaNet state fields")
         out.update(linear_layers=linear, linear_state_bytes=linear * gdn_state_bytes(cfg, model_dtype),
                    linear_conv_step_bytes=linear * gdn_conv_step_bytes(cfg, model_dtype))
+        inner = cfg.get("linear_inner_size") or (
+            int(cfg["linear_num_value_heads"]) * int(cfg["linear_value_head_dim"])
+            if cfg.get("linear_num_value_heads") and cfg.get("linear_value_head_dim") else None
+        )
+        if inner:
+            # llama.cpp allocates both recurrent tensors as F32: conv state uses
+            # (kernel - 1) * (inner + 2 * key_heads * key_dim), temporal state uses
+            # key_dim * inner (llama-hparams.cpp n_embd_r/n_embd_s).
+            per_layer = (int(cfg["linear_conv_kernel_dim"]) - 1) * (
+                int(inner) + 2 * int(cfg["linear_num_key_heads"]) * int(cfg["linear_key_head_dim"])
+            ) + int(cfg["linear_key_head_dim"]) * int(inner)
+            out["linear_state_bytes_llamacpp"] = linear * per_layer * 4
     # Gemma 4 full layers use `global_head_dim`, and with `attention_k_eq_v` `num_global_key_value_heads` KV heads
     # (vLLM transformers_utils/configs/gemma4.gemma4_layer_config). SGLang 0.5.19 applies both global fields
     # without the k_eq_v condition (utils/hf_transformers/config.py); the two agree whenever k_eq_v is set.
@@ -220,6 +238,136 @@ def estimate_params(
     return layers * per_layer + embed + hidden
 
 
+_GGUF_SCALARS = {
+    0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
+    4: ("<I", 4), 5: ("<i", 4), 6: ("<f", 4), 7: ("<?", 1),
+    10: ("<Q", 8), 11: ("<q", 8), 12: ("<d", 8),
+}
+
+
+def _gguf_string(fh) -> str:
+    size_raw = fh.read(8)
+    if len(size_raw) != 8:
+        raise ValueError("truncated GGUF string length")
+    size = struct.unpack("<Q", size_raw)[0]
+    value = fh.read(size)
+    if len(value) != size:
+        raise ValueError("truncated GGUF string")
+    return value.decode("utf-8")
+
+
+def _gguf_value(fh, kind: int) -> Any:
+    if kind == 8:
+        return _gguf_string(fh)
+    if kind in _GGUF_SCALARS:
+        fmt, size = _GGUF_SCALARS[kind]
+        raw = fh.read(size)
+        if len(raw) != size:
+            raise ValueError("truncated GGUF value")
+        return struct.unpack(fmt, raw)[0]
+    if kind == 9:
+        raw = fh.read(12)
+        if len(raw) != 12:
+            raise ValueError("truncated GGUF array header")
+        item_kind, count = struct.unpack("<IQ", raw)
+        if item_kind == 8:
+            for _ in range(count):
+                _gguf_string(fh)
+        elif item_kind in _GGUF_SCALARS:
+            fh.seek(_GGUF_SCALARS[item_kind][1] * count, os.SEEK_CUR)
+        else:
+            raise ValueError(f"unsupported GGUF array type {item_kind}")
+        return {"count": count}
+    raise ValueError(f"unsupported GGUF value type {kind}")
+
+
+def load_gguf_config(path: Union[str, Path]) -> Dict[str, Any]:
+    """Read model-shape metadata from a GGUF header without loading its tensor data."""
+    with open(path, "rb") as fh:
+        if fh.read(4) != b"GGUF":
+            raise ValueError(f"not a GGUF file: {path}")
+        version_raw = fh.read(4)
+        if len(version_raw) != 4 or struct.unpack("<I", version_raw)[0] not in (1, 2, 3):
+            raise ValueError(f"unsupported GGUF version in {path}")
+        header = fh.read(16)
+        if len(header) != 16:
+            raise ValueError(f"truncated GGUF header in {path}")
+        tensor_count, metadata_count = struct.unpack("<QQ", header)
+        metadata: Dict[str, Any] = {}
+        for _ in range(metadata_count):
+            key = _gguf_string(fh)
+            raw_kind = fh.read(4)
+            if len(raw_kind) != 4:
+                raise ValueError("truncated GGUF metadata type")
+            metadata[key] = _gguf_value(fh, struct.unpack("<I", raw_kind)[0])
+        mtp_tensors = 0
+        for _ in range(tensor_count):
+            name = _gguf_string(fh)
+            raw_dims = fh.read(4)
+            if len(raw_dims) != 4:
+                raise ValueError("truncated GGUF tensor dimensions")
+            dimensions = struct.unpack("<I", raw_dims)[0]
+            fh.seek(dimensions * 8 + 12, os.SEEK_CUR)  # dimensions, type and data offset
+            if re.search(r"(?:^|\.)(?:mtp|nextn)(?:\.|$)", name, re.I):
+                mtp_tensors += 1
+
+    arch = metadata.get("general.architecture")
+    if not isinstance(arch, str) or not arch:
+        raise ValueError("GGUF metadata has no general.architecture")
+    prefix = arch + "."
+
+    def field(name: str, default: Any = None) -> Any:
+        return metadata.get(prefix + name, default)
+
+    model_type_names = {"qwen35": ("qwen3_5", "Qwen3_5ForCausalLM"),
+                        "qwen3next": ("qwen3_next", "Qwen3NextForCausalLM")}
+    model_type, architecture = model_type_names.get(
+        arch.casefold(), (arch.casefold(), f"{arch.title()}ForCausalLM"))
+    config: Dict[str, Any] = {
+        "model_type": model_type,
+        "architectures": [architecture],
+        "hidden_size": field("embedding_length", 4096),
+        "num_hidden_layers": field("block_count", 32),
+        "num_attention_heads": field("attention.head_count", 32),
+        "num_key_value_heads": field("attention.head_count_kv"),
+        "head_dim": field("attention.key_length"),
+        "vocab_size": metadata.get("tokenizer.ggml.tokens", {}).get("count", 32000),
+        "max_position_embeddings": field("context_length", 4096),
+        "intermediate_size": field("feed_forward_length"),
+        "torch_dtype": "bfloat16",
+        "_gguf_mtp_tensor_count": mtp_tensors,
+    }
+    if config["num_key_value_heads"] is None:
+        config.pop("num_key_value_heads")
+    if config["head_dim"] is None:
+        config.pop("head_dim")
+    if config["intermediate_size"] is None:
+        config.pop("intermediate_size")
+    if arch.casefold() in model_type_names:
+        if field("nextn_predict_layers"):
+            config["_gguf_block_count_includes_mtp"] = True
+        for gguf_key, config_key in (
+            ("full_attention_interval", "full_attention_interval"),
+            ("ssm.conv_kernel", "linear_conv_kernel_dim"),
+            ("ssm.state_size", "linear_key_head_dim"),
+            ("ssm.state_size", "linear_value_head_dim"),
+            ("ssm.group_count", "linear_num_key_heads"),
+        ):
+            value = field(gguf_key)
+            if value is not None:
+                config[config_key] = value
+        state_size = field("ssm.state_size")
+        inner_size = field("ssm.inner_size")
+        if inner_size is not None:
+            config["linear_inner_size"] = inner_size
+        if state_size and inner_size and int(inner_size) % int(state_size) == 0:
+            config["linear_num_value_heads"] = int(inner_size) // int(state_size)
+    nextn = field("nextn_predict_layers")
+    if nextn:
+        config["num_nextn_predict_layers"] = nextn
+    return config
+
+
 def _load_local_config(path: str) -> Optional[Dict[str, Any]]:
     cand = os.path.join(path, "config.json") if os.path.isdir(path) else path
     if os.path.isfile(cand):
@@ -230,6 +378,8 @@ def _load_local_config(path: str) -> Optional[Dict[str, Any]]:
 
 def fetch_config(spec: ModelSpec, token: Optional[str] = None) -> Dict[str, Any]:
     """config.json for a model: local dir, or HF hub (cached)."""
+    if os.path.isfile(spec.hf_id) and spec.hf_id.lower().endswith(".gguf"):
+        return load_gguf_config(spec.hf_id)
     local = _load_local_config(spec.hf_id)
     if local is not None:
         return local
